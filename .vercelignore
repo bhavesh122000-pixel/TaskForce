@@ -1,0 +1,10 @@
+.git
+.scratch
+.env*
+data
+backups
+config.json
+tests
+*.bat
+*.vbs
+*.log

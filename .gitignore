@@ -1,0 +1,31 @@
+# Dependencies and generated output
+node_modules/
+.vercel/
+dist/
+coverage/
+*.log
+npm-debug.log*
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+config.json
+
+# Office data, attachments and backups must never be committed
+data/
+backups/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.bak
+
+# Editors and OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.tmp
+.scratch/
