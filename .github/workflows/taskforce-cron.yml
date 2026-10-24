@@ -1,0 +1,32 @@
+name: TaskForce scheduled jobs
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: taskforce-scheduled-jobs
+  cancel-in-progress: false
+
+jobs:
+  run-scheduled-jobs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Call TaskForce cron endpoint
+        env:
+          TASKFORCE_URL: ${{ vars.TASKFORCE_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TASKFORCE_URL" || -z "$CRON_SECRET" ]]; then
+            echo "Set the TASKFORCE_URL variable and CRON_SECRET secret in GitHub Actions settings."
+            exit 1
+          fi
+          curl --fail --silent --show-error --max-time 240 \
+            -H "Authorization: Bearer ${CRON_SECRET}" \
+            "${TASKFORCE_URL%/}/api/cron"
