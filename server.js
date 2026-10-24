@@ -16,8 +16,10 @@ module.exports = async (req, res) => {
 module.exports.createApplication = createApplication;
 if (require.main === module) {
   getApplication().then(runtime => {
-    runtime.app.listen(runtime.port, '0.0.0.0', () => console.log(`TaskForce is running at http://localhost:${runtime.port} using ${runtime.db.dialect === 'postgres' ? 'Supabase' : 'local SQLite'}.`));
-    setInterval(() => runtime.jobs().catch(error => console.error('[jobs]', error.message)), 10 * 60e3).unref();
-    setTimeout(() => runtime.jobs().catch(error => console.error('[jobs]', error.message)), 5000).unref();
+    runtime.app.listen(runtime.port, '0.0.0.0', () => console.log(`TaskForce is running at http://localhost:${runtime.port} using Supabase PostgreSQL.`));
+    if (process.env.TF_SCHEDULER !== 'external') {
+      setInterval(() => runtime.jobs().catch(error => console.error('[jobs]', error.message)), 10 * 60e3).unref();
+      setTimeout(() => runtime.jobs().catch(error => console.error('[jobs]', error.message)), 5000).unref();
+    }
   }).catch(error => { console.error(error.message); process.exitCode = 1; });
 }

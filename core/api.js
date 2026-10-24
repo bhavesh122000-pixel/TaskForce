@@ -1,6 +1,6 @@
 const { mapAsync, forEachAsync } = require('./async');
 // TaskForce engine: every rule and API route lives here.
-// The office server (server.js) and the browser test version both run this same file.
+// Shared application rules backed by PostgreSQL.
 const W = require('./workflow');
 const { initSchema, seedChecklists, seedMilestones, ensureLibrary, copyTemplates, defaultStages, seedHolidays } = require('./schema');
 
@@ -59,7 +59,8 @@ async function createCore({ db, platform }) {
   const qa = async (sql, ...p) => await db.prepare(sql).all(...p);
   const run = async (sql, ...p) => await db.prepare(sql).run(...p);
   async function tx(fn) {await db.exec('BEGIN');try {const r = await fn();await db.exec('COMMIT');return r;} catch (e) {await db.exec('ROLLBACK');throw e;}}
-  const getSetting = async (k, d = '') => {const r = await q1('SELECT value FROM settings WHERE key = ?', k);return r ? r.value : d;};
+  const settings = () => db.memo('settings', async () => new Map((await qa('SELECT key, value FROM settings')).map(r => [r.key, r.value])));
+  const getSetting = async (k, d = '') => { const rows = await settings(); return rows.has(k) ? rows.get(k) : d; };
   const setSetting = async (k, v) => await run('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', k, v == null ? '' : String(v));
 
   /* ---------- shared helpers ---------- */
@@ -114,7 +115,9 @@ async function createCore({ db, platform }) {
     await run('INSERT INTO notifications (user_id, task_id, matter_id, callback_id, kind, text, created_at) VALUES (?,?,?,?,?,?,?)', userId, taskId, matterId, callbackId, kind, text, now());
     if (u.email_alerts && (await platform.mailConfigured(getSetting))) {
       const link = callbackId ? `/#/callbacks/${callbackId}` : taskId ? `/#/task/${taskId}` : matterId ? `/#/matters/${matterId}` : '/';
-      Promise.resolve(platform.sendMail(getSetting, { to: u.email, subject: emailSubject || text, text, link })).catch((e) => console.error('[mail]', e.message));
+      const options = { to: u.email, subject: emailSubject || text, text, link };
+      if (platform.queueMail) await platform.queueMail(getSetting, options);
+      else Promise.resolve(platform.sendMail(getSetting, options)).catch(e => console.error('[mail]', e.message));
     }
   }
   const nextPos = async (status) => ((await q1('SELECT MAX(position) AS p FROM tasks WHERE status = ?', status)).p || 0) + 1;
@@ -182,7 +185,8 @@ async function createCore({ db, platform }) {
     if (own.length) return own.map(stageRow);
     const side = W.sideOf(m.type);
     if (!side || side === 'T') return [];
-    const lib = await qa('SELECT * FROM checklist_stages WHERE checklist_key = ? ORDER BY position, id', side === 'V' ? 'BC-V' : 'BC-P');
+    const allStages = await db.memo('library-stages', () => qa('SELECT * FROM checklist_stages ORDER BY position, id'));
+    const lib = allStages.filter(row => row.checklist_key === (side === 'V' ? 'BC-V' : 'BC-P'));
     if (lib.length) return lib.map(stageRow);
     return defaultStages(side, await legacyTiming()).map(stageRow);
   }
@@ -229,27 +233,31 @@ async function createCore({ db, platform }) {
     let own = await qa('SELECT * FROM matter_stages WHERE matter_id = ? ORDER BY position, id', m.id);
     if (!own.length && (await q1('SELECT id FROM matter_items WHERE matter_id = ? LIMIT 1', m.id))) {
       // an older matter: keep its existing stages before adding more
-      await forEachAsync(await stagesFor(m, []), async (s, i) => await run('INSERT INTO matter_stages (matter_id, key, label, from_kind, days, when_text, position) VALUES (?,?,?,?,?,?,?)', m.id, s.key, s.label, s.from, s.days, s.when || '', i));
+      await db.insertMany('matter_stages', ['matter_id','key','label','from_kind','days','when_text','position'], (await stagesFor(m, [])).map((s, i) => [m.id, s.key, s.label, s.from, s.days, s.when || '', i]));
       own = await qa('SELECT * FROM matter_stages WHERE matter_id = ? ORDER BY position, id', m.id);
     }
     const have = new Set(own.map((s) => s.key));
     let pos = own.length;
-    for (const s of libStages) if (!have.has(s.key)) await run('INSERT INTO matter_stages (matter_id, key, label, from_kind, days, when_text, position) VALUES (?,?,?,?,?,?,?)', m.id, s.key, s.label, s.from_kind, s.days, s.when_text, pos++);
+    await db.insertMany('matter_stages', ['matter_id','key','label','from_kind','days','when_text','position'], libStages.filter(s => !have.has(s.key)).map(s => [m.id, s.key, s.label, s.from_kind, s.days, s.when_text, pos++]));
     const allowed = new Set(libStages.map((s) => s.key));
     const tpl = await qa('SELECT * FROM checklist_templates WHERE checklist_key = ? ORDER BY parent_id IS NOT NULL, position, id', key);
     const map = new Map();
     let n = 0;
     const existing = await qa('SELECT id, stage, parent_id, title FROM matter_items WHERE matter_id = ?', m.id);
     const same = (stage, parentId, title) => existing.find((e) => e.stage === stage && (e.parent_id || null) === (parentId || null) && e.title.trim().toLowerCase() === title.trim().toLowerCase());
+    const ids = await db.reserveIds('matter_items', tpl.length), additions = [], updates = [];
     for (const t of tpl) {
       if (!allowed.has(t.stage)) continue;
       const parent = t.parent_id ? map.get(t.parent_id) : null;
       if (t.parent_id && !parent) continue;
       const dup = same(t.stage, parent, t.title);
-      if (dup) {map.set(t.id, dup.id);if (t.ms) await run('UPDATE matter_items SET tpl_id = COALESCE(tpl_id, ?), ms = COALESCE(ms, ?) WHERE id = ?', t.id, t.ms, dup.id);continue;} // already on the matter
-      const r = await run('INSERT INTO matter_items (matter_id, stage, parent_id, title, position, updated_at, tpl_id, ms) VALUES (?,?,?,?,?,?,?,?)', m.id, t.stage, parent || null, t.title, t.position, now(), t.id, t.ms || null);
-      map.set(t.id, Number(r.lastInsertRowid));n++;
+      if (dup) {map.set(t.id, dup.id);if (t.ms && !updates.some(row => row.id === dup.id)) updates.push({ id: dup.id, tpl_id: t.id, ms: t.ms });continue;} // already on the matter
+      const id = ids[n];
+      additions.push([id, m.id, t.stage, parent || null, t.title, t.position, now(), t.id, t.ms || null]);
+      map.set(t.id, id);n++;
     }
+    await db.insertMany('matter_items', ['id','matter_id','stage','parent_id','title','position','updated_at','tpl_id','ms'], additions);
+    if (updates.length) await run('UPDATE matter_items AS item SET tpl_id = COALESCE(item.tpl_id, v.tpl_id), ms = COALESCE(item.ms, v.ms) FROM jsonb_to_recordset(?::jsonb) AS v(id bigint, tpl_id bigint, ms text) WHERE item.id = v.id', JSON.stringify(updates));
     await log({ matterId: m.id, userId: actorId, action: `added the “${lib.name}” checklist (${n} items)` });
     return n || 1;
   }
@@ -268,27 +276,33 @@ async function createCore({ db, platform }) {
     if (d <= 7 && rd.blockers.length) reasons.push('Still blocked in the final week – ' + rd.blockers.join('; '));
     return reasons;
   }
-  async function enrichMatters(list) {
+  const jsonRows = sql => `(SELECT COALESCE(jsonb_agg(rows), '[]'::jsonb) FROM (${sql}) rows)`;
+  function groupBy(rows, key) {
+    const groups = new Map();
+    for (const row of rows) { if (!groups.has(row[key])) groups.set(row[key], []); groups.get(row[key]).push(row); }
+    return groups;
+  }
+  async function enrichMatters(list, loaded) {
     if (!list.length) return list;
-    const ids = list.map((m) => m.id);
-    const items = await qa(`SELECT id, matter_id, stage, parent_id, title, status, value, person_id, position, ms FROM matter_items WHERE matter_id IN (${ids.map(() => '?').join(',')})`, ...ids);
-    const tasks = await qa(`SELECT matter_id, status, due_date FROM tasks WHERE matter_id IN (${ids.map(() => '?').join(',')})`, ...ids);
-    const mstages = await qa(`SELECT * FROM matter_stages WHERE matter_id IN (${ids.map(() => '?').join(',')}) ORDER BY position, id`, ...ids);
+    const ids = list.map(m => m.id);
+    const data = loaded || await q1(`SELECT
+      ${jsonRows('SELECT * FROM matter_items WHERE matter_id = ANY(?::bigint[])')} AS items,
+      ${jsonRows('SELECT matter_id, status, due_date FROM tasks WHERE matter_id = ANY(?::bigint[])')} AS tasks,
+      ${jsonRows('SELECT * FROM matter_stages WHERE matter_id = ANY(?::bigint[]) ORDER BY position, id')} AS stages`, ids, ids, ids);
+    const itemGroups = groupBy(data.items, 'matter_id'), taskGroups = groupBy(data.tasks, 'matter_id'), stageGroups = groupBy(data.stages, 'matter_id');
     const td = today();
-    return await mapAsync(list, async (m) => {
-      const its = items.filter((i) => i.matter_id === m.id);
-      const ts = tasks.filter((t) => t.matter_id === m.id);
+    return await mapAsync(list, async m => {
+      const its = itemGroups.get(m.id) || [], ts = taskGroups.get(m.id) || [], ms = stageGroups.get(m.id) || [];
       const values = parseReadiness(m);
-      const ms = mstages.filter((x) => x.matter_id === m.id);
       const cl = await checklistSummary(m, its, ms);
       const miles = await milestonesOf(m, its, await stagesFor(m, ms), values);
       const rd = W.readinessOf(m, values, miles);
-      const open = ts.filter((t) => t.status !== 'done');
+      const open = ts.filter(t => t.status !== 'done');
       return {
         ...m, name: matterName(m), side: W.sideOf(m.type), readiness: values, ready: rd, milestones: miles,
         checklist: { total: cl.total, done: cl.done, current: cl.current, overdue: cl.overdue, stuck: cl.stuck.length, has: its.length > 0 },
         open_tasks: open.length, done_tasks: ts.length - open.length,
-        overdue_tasks: open.filter((t) => t.due_date && t.due_date < td).length,
+        overdue_tasks: open.filter(t => t.due_date && t.due_date < td).length,
         escalations: escalationsFor(m, rd, cl)
       };
     });
@@ -322,13 +336,14 @@ async function createCore({ db, platform }) {
       (SELECT COUNT(*) FROM checklist_items c WHERE c.task_id = t.id AND c.done = 1) AS check_done
     FROM tasks t LEFT JOIN matters m ON m.id = t.matter_id LEFT JOIN matter_items i ON i.id = t.item_id`;
   async function taskFull(id) {
-    const t = await q1(`${TASK_SELECT} WHERE t.id = ?`, id);
+    const t = await q1(`SELECT detail.*,
+      ${jsonRows('SELECT * FROM checklist_items WHERE task_id = detail.id ORDER BY position, id')} AS checklist,
+      ${jsonRows('SELECT * FROM notes WHERE task_id = detail.id ORDER BY id')} AS notes,
+      ${jsonRows('SELECT * FROM activity WHERE task_id = detail.id ORDER BY id')} AS activity,
+      ${jsonRows('SELECT id, filename, mime, size, email_meta, uploaded_by, created_at FROM attachments WHERE task_id = detail.id ORDER BY id')} AS attachments
+      FROM (${TASK_SELECT} WHERE t.id = ?) detail`, id);
     if (!t) return null;
-    t.checklist = await qa('SELECT * FROM checklist_items WHERE task_id = ? ORDER BY position, id', id);
-    t.notes = await qa('SELECT * FROM notes WHERE task_id = ? ORDER BY id', id);
-    t.activity = await qa('SELECT * FROM activity WHERE task_id = ? ORDER BY id', id);
-    t.attachments = (await qa('SELECT id, filename, mime, size, email_meta, uploaded_by, created_at FROM attachments WHERE task_id = ? ORDER BY id', id)).
-    map((a) => ({ ...a, email_meta: a.email_meta ? JSON.parse(a.email_meta) : null }));
+    t.attachments = t.attachments.map(a => ({ ...a, email_meta: a.email_meta ? JSON.parse(a.email_meta) : null }));
     return t;
   }
   // When a task linked to a checklist item is finished, tick the item (and the other way round)
@@ -356,24 +371,28 @@ async function createCore({ db, platform }) {
 
   /* ---------- matter detail ---------- */
   async function matterFull(id) {
-    const m0 = await q1('SELECT * FROM matters WHERE id = ?', id);
-    if (!m0) return null;
-    const [m] = await enrichMatters([m0]);
-    const items = await qa('SELECT * FROM matter_items WHERE matter_id = ? ORDER BY position, id', id);
-    const linked = await qa('SELECT id, item_id, status, assignee_id FROM tasks WHERE matter_id = ? AND item_id IS NOT NULL', id);
-    const cl = await checklistSummary(m0, items);
-    const msById = new Map(m.milestones.map((x) => [x.id, x]));
-    items.forEach((i) => {i.ms = W.parseMs(i.ms);const x = msById.get(i.id);if (x) {i.due = x.due;i.overdue = x.overdue;i.ms_label = x.label;}});
-    m.timeline = { opened: (m0.created_at || '').slice(0, 10), stages: await mapAsync(await stagesFor(m0), async (s) => ({ key: s.key, label: s.label, due: await stageDue(s, m0) })) };
-    m.checklist_name = ((await q1("SELECT c.name FROM checklists c WHERE c.key = ?", (await typeChecklists())[m0.type] || '')) || {}).name || null;
-    m.stages = cl.stages.map((s) => ({ ...s, items: items.filter((i) => i.stage === s.key && !i.parent_id).map((i) => ({
-        ...i, tasks: linked.filter((t) => t.item_id === i.id),
-        children: items.filter((c) => c.parent_id === i.id).map((c) => ({ ...c, tasks: linked.filter((t) => t.item_id === c.id) }))
-      })) }));
-    m.tasks = await qa(`${TASK_SELECT} WHERE t.matter_id = ? ORDER BY (t.status = 'done'), (t.due_date IS NULL), t.due_date, t.id`, id);
-    m.activity = await qa('SELECT a.*, t.title AS task_title FROM activity a LEFT JOIN tasks t ON t.id = a.task_id WHERE a.matter_id = ? ORDER BY a.id DESC LIMIT 80', id);
-    m.related = await qa('SELECT id, code, type, client FROM matters WHERE code = ? AND id <> ?', m0.code, id);
-    m.callbacks = await qa("SELECT * FROM callbacks WHERE matter_id = ? ORDER BY (status = 'open') DESC, COALESCE(completed_at, created_at) DESC", id);
+    const data = await q1(`SELECT outer_m.*,
+      ${jsonRows('SELECT * FROM matter_items WHERE matter_id = outer_m.id ORDER BY position, id')} AS _items,
+      ${jsonRows('SELECT * FROM matter_stages WHERE matter_id = outer_m.id ORDER BY position, id')} AS _stages,
+      ${jsonRows(`${TASK_SELECT} WHERE t.matter_id = outer_m.id ORDER BY (t.status = 'done'), (t.due_date IS NULL), t.due_date, t.id`)} AS _tasks,
+      ${jsonRows('SELECT a.*, t.title AS task_title FROM activity a LEFT JOIN tasks t ON t.id = a.task_id WHERE a.matter_id = outer_m.id ORDER BY a.id DESC LIMIT 80')} AS _activity,
+      ${jsonRows('SELECT r.id, r.code, r.type, r.client FROM matters r WHERE lower(r.code) = lower(outer_m.code) AND r.id <> outer_m.id')} AS _related,
+      ${jsonRows("SELECT * FROM callbacks WHERE matter_id = outer_m.id ORDER BY (status = 'open') DESC, COALESCE(completed_at, created_at) DESC")} AS _callbacks
+      FROM matters outer_m WHERE outer_m.id = ?`, id);
+    if (!data) return null;
+    const { _items: items, _stages: stageRows, _tasks: tasks, _activity: activity, _related: related, _callbacks: callbacks, ...m0 } = data;
+    const [m] = await enrichMatters([m0], { items, stages: stageRows, tasks });
+    const linked = tasks.filter(t => t.item_id != null).map(({ id, item_id, status, assignee_id }) => ({ id, item_id, status, assignee_id }));
+    const cl = await checklistSummary(m0, items, stageRows);
+    const msById = new Map(m.milestones.map(x => [x.id, x]));
+    items.forEach(i => { i.ms = W.parseMs(i.ms); const x = msById.get(i.id); if (x) { i.due = x.due; i.overdue = x.overdue; i.ms_label = x.label; } });
+    m.timeline = { opened: (m0.created_at || '').slice(0, 10), stages: await mapAsync(await stagesFor(m0, stageRows), async s => ({ key: s.key, label: s.label, due: await stageDue(s, m0) })) };
+    m.checklist_name = ((await q1('SELECT name FROM checklists WHERE key = ?', (await typeChecklists())[m0.type] || '')) || {}).name || null;
+    m.stages = cl.stages.map(s => ({ ...s, items: items.filter(i => i.stage === s.key && !i.parent_id).map(i => ({
+      ...i, tasks: linked.filter(t => t.item_id === i.id),
+      children: items.filter(c => c.parent_id === i.id).map(c => ({ ...c, tasks: linked.filter(t => t.item_id === c.id) }))
+    })) }));
+    m.tasks = tasks; m.activity = activity; m.related = related; m.callbacks = callbacks;
     return m;
   }
   function matterFields(b) {
@@ -500,7 +519,7 @@ async function createCore({ db, platform }) {
     const g = guard(ip);
     const mode = await loginMode();
     if (mode === 'code') throw err('Sign in with a code sent to your email.');
-    const u = await q1('SELECT * FROM users WHERE email = ?', String(body.email || '').trim());
+    const u = await q1('SELECT * FROM users WHERE lower(email) = lower(?)', String(body.email || '').trim());
     if (!u || !u.active || !(await platform.checkPassword(String(body.password || ''), u.password_hash))) {g.fail();throw err('That email and password don’t match.', 401);}
     g.ok();
     if (mode === 'both') {await sendCode(u, 'login2');return { needCode: true, email: u.email };}
@@ -510,7 +529,7 @@ async function createCore({ db, platform }) {
     const g = guard(ip);
     const mode = await loginMode();
     if (!['either', 'code'].includes(mode)) throw err(mode === 'both' ? 'Enter your password first – the code is emailed after that.' : 'Emailed codes aren’t turned on. Sign in with your password.');
-    const u = await q1('SELECT * FROM users WHERE email = ?', String(body.email || '').trim());
+    const u = await q1('SELECT * FROM users WHERE lower(email) = lower(?)', String(body.email || '').trim());
     if (!u || !u.active) {g.fail();return { ok: true };} // don't reveal who has an account
     await sendCode(u, 'login');
     return { ok: true };
@@ -518,13 +537,13 @@ async function createCore({ db, platform }) {
   on('POST', '/api/login/code', async ({ body, ip }) => {
     const g = guard(ip);
     const mode = await loginMode();
-    const u = await q1('SELECT * FROM users WHERE email = ?', String(body.email || '').trim());
+    const u = await q1('SELECT * FROM users WHERE lower(email) = lower(?)', String(body.email || '').trim());
     const code = String(body.code || '').replace(/\D/g, '');
     const purpose = mode === 'both' ? 'login2' : 'login';
     const row = u ? await q1('SELECT * FROM login_codes WHERE user_id = ? AND purpose = ? AND used = 0 ORDER BY id DESC LIMIT 1', u.id, purpose) : null;
     if (!u || !u.active || !row || row.expires_at < now()) {g.fail();throw err('That code has expired or isn’t right. Ask for a new one.', 401);}
-    if (row.tries >= 5) {await run('UPDATE login_codes SET used = 1 WHERE id = ?', row.id);throw err('Too many wrong codes. Ask for a new one.', 429);}
-    if (code.length !== 6 || !(await platform.checkPassword(code, row.code_hash))) {await run('UPDATE login_codes SET tries = tries + 1 WHERE id = ?', row.id);g.fail();throw err('That code isn’t right. Check the latest email and try again.', 401);}
+    if (row.tries >= 5) {await run('UPDATE login_codes SET used = 1 WHERE id = ?', row.id);throw Object.assign(err('Too many wrong codes. Ask for a new one.', 429), { commitOnError: true });}
+    if (code.length !== 6 || !(await platform.checkPassword(code, row.code_hash))) {await run('UPDATE login_codes SET tries = tries + 1 WHERE id = ?', row.id);g.fail();throw Object.assign(err('That code isn’t right. Check the latest email and try again.', 401), { commitOnError: true });}
     await run('UPDATE login_codes SET used = 1 WHERE id = ?', row.id);
     g.ok();
     return { user: pub(u), _session: await startSession(u.id) };
@@ -550,7 +569,7 @@ async function createCore({ db, platform }) {
     const { name, email, password, role, color } = body;
     if (!name || !email || !password) throw err('Enter a name, email and starting password.');
     if (String(password).length < 8) throw err('Use at least 8 characters for the password.');
-    if (await q1('SELECT id FROM users WHERE email = ?', email.trim())) throw err('Someone already uses that email.');
+    if (await q1('SELECT id FROM users WHERE lower(email) = lower(?)', email.trim())) throw err('Someone already uses that email.');
     const used = (await qa('SELECT color FROM users')).map((r) => r.color);
     const c = COLORS.includes(color) ? color : COLORS.find((x) => !used.includes(x)) || 'blue';
     const r = await run('INSERT INTO users (name,email,initials,color,password_hash,role,tax_access) VALUES (?,?,?,?,?,?,?)', name.trim(), email.trim(), initialsFor(name), c, await platform.hashPassword(password), role === 'admin' ? 'admin' : 'staff', body.tax_access ? 1 : 0);
@@ -562,7 +581,7 @@ async function createCore({ db, platform }) {
     if (u.id === me.id && (body.active === false || body.role === 'staff')) throw err('You can’t remove your own admin access.');
     if (body.name != null) await run('UPDATE users SET name = ?, initials = ? WHERE id = ?', String(body.name).trim(), initialsFor(body.name), u.id);
     if (body.email != null) {
-      if (await q1('SELECT id FROM users WHERE email = ? AND id <> ?', String(body.email).trim(), u.id)) throw err('Someone already uses that email.');
+      if (await q1('SELECT id FROM users WHERE lower(email) = lower(?) AND id <> ?', String(body.email).trim(), u.id)) throw err('Someone already uses that email.');
       await run('UPDATE users SET email = ? WHERE id = ?', String(body.email).trim(), u.id);
     }
     if (body.role != null) await run('UPDATE users SET role = ? WHERE id = ?', body.role === 'admin' ? 'admin' : 'staff', u.id);
@@ -587,7 +606,7 @@ async function createCore({ db, platform }) {
     if (q.overdue === '1') {where.push("t.status <> 'done' AND t.due_date IS NOT NULL AND t.due_date < ?");p.push(today());}
     if (q.from) {where.push('t.due_date >= ?');p.push(q.from);}
     if (q.to) {where.push('t.due_date <= ?');p.push(q.to);}
-    if (q.q) {where.push('(t.title LIKE ? OR t.description LIKE ? OR m.code LIKE ? OR m.address LIKE ? OR m.client LIKE ?)');const l = `%${q.q}%`;p.push(l, l, l, l, l);}
+    if (q.q) {where.push('(t.title ILIKE ? OR t.description ILIKE ? OR m.code ILIKE ? OR m.address ILIKE ? OR m.client ILIKE ?)');const l = `%${q.q}%`;p.push(l, l, l, l, l);}
     if (q.repeating === '1') {where.push("t.repeat IS NOT NULL AND t.status <> 'done'");}
     if (!canTax(me)) where.push(`(t.matter_id IS NULL OR m.type IS NULL OR m.type NOT IN ${TAX_IN})`);
     if (q.done_days && !q.status) {where.push("(t.status <> 'done' OR t.completed_at >= ?)");p.push(addDays(today(), -parseInt(q.done_days, 10)) + ' 00:00:00');}
@@ -609,7 +628,7 @@ async function createCore({ db, platform }) {
     const r = await run(`INSERT INTO tasks (title, description, matter_id, assignee_id, created_by, due_date, due_time, duration, priority, status, position, repeat, repeat_until, series_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     t.title, t.description, t.matter_id, t.assignee_id, t.created_by, next, t.due_time, t.duration, t.priority, 'todo', await nextPos('todo'), t.repeat, t.repeat_until, t.series_id || t.id, now(), now());
     const nid = Number(r.lastInsertRowid);
-    await forEachAsync(await qa('SELECT * FROM checklist_items WHERE task_id = ? ORDER BY position, id', t.id), async (c) => await run('INSERT INTO checklist_items (task_id, text, position) VALUES (?,?,?)', nid, c.text, c.position));
+    await run('INSERT INTO checklist_items (task_id, text, position) SELECT ?, text, position FROM checklist_items WHERE task_id = ? ORDER BY position, id', nid, t.id);
     await run('UPDATE tasks SET repeat_next_id = ? WHERE id = ?', nid, t.id);
     await log({ taskId: t.id, matterId: t.matter_id, userId: actorId, action: `repeats ${repeatLabel(t.repeat)} – next one due ${fmtDate(next)}` });
     await log({ taskId: nid, matterId: t.matter_id, userId: actorId, action: `created this from the repeating task (${repeatLabel(t.repeat)})` });
@@ -633,7 +652,7 @@ async function createCore({ db, platform }) {
       String(b.title).trim(), b.description || '', matterId, b.item_id || null, assignee, me.id, due, dueTime, dueTime ? duration : null, PRIORITIES.includes(b.priority) ? b.priority : 'normal', status, await nextPos(status), repeat, until, status === 'done' ? now() : null, now(), now());
       const tid = Number(r.lastInsertRowid);
       await log({ taskId: tid, matterId, userId: me.id, action: (b.item_id ? 'created this task from the matter checklist' : 'created this task') + (repeat ? ` (repeats ${repeatLabel(repeat)})` : '') });
-      if (Array.isArray(b.checklist)) await forEachAsync(b.checklist.filter((x) => String(x).trim()), async (text, i) => await run('INSERT INTO checklist_items (task_id, text, position) VALUES (?,?,?)', tid, String(text).trim(), i));
+      if (Array.isArray(b.checklist)) await db.insertMany('checklist_items', ['task_id','text','position'], b.checklist.filter(x => String(x).trim()).map((text, i) => [tid, String(text).trim(), i]));
       return tid;
     });
     const t = await q1('SELECT * FROM tasks WHERE id = ?', id);
@@ -851,7 +870,7 @@ async function createCore({ db, platform }) {
     if (q.status && q.status !== 'all') {where.push('m.status = ?');p.push(q.status);}
     if (q.type) {const ts = String(q.type).split(',').filter((t) => W.TYPE[t]);if (ts.length) {where.push(`m.type IN (${ts.map(() => '?').join(',')})`);p.push(...ts);}}
     if (q.responsible) {where.push('m.responsible_id = ?');p.push(+q.responsible);}
-    if (q.q) {where.push('(m.code LIKE ? OR m.address LIKE ? OR m.client LIKE ? OR m.other_side LIKE ?)');const l = `%${q.q}%`;p.push(l, l, l, l);}
+    if (q.q) {where.push('(m.code ILIKE ? OR m.address ILIKE ? OR m.client ILIKE ? OR m.other_side ILIKE ?)');const l = `%${q.q}%`;p.push(l, l, l, l);}
     const list = await qa(`SELECT * FROM matters m ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY (m.settlement_date IS NULL), m.settlement_date, m.code, m.type`, ...p);
     if (q.brief === '1') return list.map((m) => ({ id: m.id, code: m.code, type: m.type, client: m.client, address: m.address, status: m.status, settlement_date: m.settlement_date, finance_date: m.finance_date, responsible_id: m.responsible_id, name: matterName(m) }));
     return await enrichMatters(list);
@@ -873,7 +892,7 @@ async function createCore({ db, platform }) {
     const f = matterFields(body);
     if (!f.code) throw err('Enter the matter code, like BC1234.');
     f.type = f.type || 'P';
-    if (await q1('SELECT id FROM matters WHERE code = ? AND type = ?', f.code, f.type)) throw err(`${f.code} ${W.TYPE[f.type].short} already exists.`);
+    if (await q1('SELECT id FROM matters WHERE lower(code) = lower(?) AND type = ?', f.code, f.type)) throw err(`${f.code} ${W.TYPE[f.type].short} already exists.`);
     f.responsible_id = f.responsible_id || me.id;
     if (isTax(f.type)) {const u = await userById(f.responsible_id);if (u && !canTax(u)) throw err(`${u.name} doesn’t have Taxation access, so they can’t be responsible for a taxation job.`);}
     const id = await tx(async () => {
@@ -894,7 +913,7 @@ async function createCore({ db, platform }) {
     const m = await q1('SELECT * FROM matters WHERE id = ?', +params.id);if (!m) throw err('That matter no longer exists.', 404);
     const f = matterFields(body);
     const code = f.code || m.code,type = f.type || m.type;
-    if ((code !== m.code || type !== m.type) && (await q1('SELECT id FROM matters WHERE code = ? AND type = ? AND id <> ?', code, type, m.id))) throw err(`${code} ${W.TYPE[type].short} already exists.`);
+    if ((code !== m.code || type !== m.type) && (await q1('SELECT id FROM matters WHERE lower(code) = lower(?) AND type = ? AND id <> ?', code, type, m.id))) throw err(`${code} ${W.TYPE[type].short} already exists.`);
     const keys = Object.keys(f).filter((k) => f[k] !== m[k]);
     if (!keys.length) return { ok: true };
     if (isTax(type)) {const u = await userById(f.responsible_id !== undefined ? f.responsible_id : m.responsible_id);if (u && !canTax(u)) throw err(`${u.name} doesn’t have Taxation access, so they can’t be responsible for a taxation job.`);}
@@ -953,7 +972,7 @@ async function createCore({ db, platform }) {
     const title = String(body.title || '').trim();if (!title) throw err('Enter the checklist item.');
     const stage = (await stagesFor(m)).find((s) => s.key === body.stage);if (!stage) throw err('Choose a stage.');
     const parent = body.parent_id ? await q1('SELECT * FROM matter_items WHERE id = ? AND matter_id = ?', +body.parent_id, m.id) : null;
-    const pos = ((await q1('SELECT MAX(position) AS p FROM matter_items WHERE matter_id = ? AND stage = ? AND parent_id IS ?', m.id, stage.key, parent ? parent.id : null)).p || 0) + 1;
+    const pos = ((await q1('SELECT MAX(position) AS p FROM matter_items WHERE matter_id = ? AND stage = ? AND parent_id IS NOT DISTINCT FROM ?', m.id, stage.key, parent ? parent.id : null)).p || 0) + 1;
     await run('INSERT INTO matter_items (matter_id, stage, parent_id, title, position, updated_by, updated_at) VALUES (?,?,?,?,?,?,?)', m.id, stage.key, parent ? parent.id : null, title, pos, me.id, now());
     await log({ matterId: m.id, userId: me.id, action: `added “${title}” to ${stage.label}` });
     await touchMatter(m.id);return await matterFull(m.id);
@@ -1020,10 +1039,11 @@ async function createCore({ db, platform }) {
   const libKey = async (k) => {const c = await q1('SELECT * FROM checklists WHERE key = ?', String(k || ''));if (!c) throw err('That checklist no longer exists.', 404);return c;};
   const newKey = () => 'cl' + platform.randomToken().slice(0, 8);
   on('GET', '/api/library', async ({ me }) => {
-    const lists = await mapAsync((await qa('SELECT * FROM checklists ORDER BY position, id')).filter((c) => c.area !== 'tax' || canTax(me)), async (c) => ({ ...c,
-      stages: (await q1('SELECT COUNT(*) AS n FROM checklist_stages WHERE checklist_key = ?', c.key)).n,
-      items: (await q1('SELECT COUNT(*) AS n FROM checklist_templates WHERE checklist_key = ?', c.key)).n,
-      milestones: (await q1("SELECT COUNT(*) AS n FROM checklist_templates WHERE checklist_key = ? AND ms IS NOT NULL AND ms <> ''", c.key)).n }));
+    const lists = (await qa(`SELECT c.*,
+      (SELECT COUNT(*) FROM checklist_stages s WHERE s.checklist_key = c.key) AS stages,
+      (SELECT COUNT(*) FROM checklist_templates t WHERE t.checklist_key = c.key) AS items,
+      (SELECT COUNT(*) FROM checklist_templates t WHERE t.checklist_key = c.key AND t.ms IS NOT NULL AND t.ms <> '') AS milestones
+      FROM checklists c ORDER BY c.position, c.id`)).filter(c => c.area !== 'tax' || canTax(me));
     const types = await typeChecklists();
     if (!canTax(me)) W.MATTER_TYPES.filter((t) => t.area === 'tax').forEach((t) => delete types[t.key]);
     return { checklists: lists, types, areas: W.AREAS.filter((a) => a.key !== 'tax' || canTax(me)) };
@@ -1138,7 +1158,7 @@ async function createCore({ db, platform }) {
     if (!(await q1('SELECT id FROM checklist_stages WHERE checklist_key = ? AND key = ?', c.key, String(body.stage || '')))) throw err('Choose a stage.');
     const title = String(body.title || '').trim();if (!title) throw err('Enter the item.');
     const parent = body.parent_id ? +body.parent_id : null;
-    const pos = ((await q1('SELECT MAX(position) AS p FROM checklist_templates WHERE checklist_key = ? AND stage = ? AND parent_id IS ?', c.key, body.stage, parent)).p || 0) + 1;
+    const pos = ((await q1('SELECT MAX(position) AS p FROM checklist_templates WHERE checklist_key = ? AND stage = ? AND parent_id IS NOT DISTINCT FROM ?', c.key, body.stage, parent)).p || 0) + 1;
     await run('INSERT INTO checklist_templates (side, checklist_key, stage, parent_id, title, position) VALUES (?,?,?,?,?,?)', c.area === 'tax' ? 'T' : c.key === 'BC-V' ? 'V' : 'P', c.key, body.stage, parent, title, pos);
     return { ok: true };
   });
@@ -1160,9 +1180,9 @@ async function createCore({ db, platform }) {
             if (await q1('SELECT id FROM matter_items WHERE matter_id = ? AND tpl_id = ?', mid, t.id)) continue;
             let parentId = null;
             if (t.parent_id) {const pi = await q1('SELECT id FROM matter_items WHERE matter_id = ? AND tpl_id = ?', mid, t.parent_id);if (!pi) continue;parentId = pi.id;}
-            const same = await q1('SELECT id FROM matter_items WHERE matter_id = ? AND stage = ? AND parent_id IS ? AND lower(trim(title)) = lower(trim(?))', mid, t.stage, parentId, t.title);
+            const same = await q1('SELECT id FROM matter_items WHERE matter_id = ? AND stage = ? AND parent_id IS NOT DISTINCT FROM ? AND lower(trim(title)) = lower(trim(?))', mid, t.stage, parentId, t.title);
             if (same) {await run('UPDATE matter_items SET tpl_id = ?, ms = ? WHERE id = ?', t.id, v, same.id);updated++;continue;}
-            const pos = ((await q1('SELECT MAX(position) AS p FROM matter_items WHERE matter_id = ? AND stage = ? AND parent_id IS ?', mid, t.stage, parentId)).p || 0) + 1;
+            const pos = ((await q1('SELECT MAX(position) AS p FROM matter_items WHERE matter_id = ? AND stage = ? AND parent_id IS NOT DISTINCT FROM ?', mid, t.stage, parentId)).p || 0) + 1;
             await run('INSERT INTO matter_items (matter_id, stage, parent_id, title, position, updated_by, updated_at, tpl_id, ms) VALUES (?,?,?,?,?,?,?,?,?)', mid, t.stage, parentId, t.title, pos, me.id, now(), t.id, v);
             await log({ matterId: mid, userId: me.id, action: `added the milestone “${t.title}” from the checklist library` });
             added++;
@@ -1171,7 +1191,7 @@ async function createCore({ db, platform }) {
       });
     }
     if (body.move) {
-      const sibs = await qa('SELECT * FROM checklist_templates WHERE checklist_key = ? AND stage = ? AND parent_id IS ? ORDER BY position, id', t.checklist_key, t.stage, t.parent_id);
+      const sibs = await qa('SELECT * FROM checklist_templates WHERE checklist_key = ? AND stage = ? AND parent_id IS NOT DISTINCT FROM ? ORDER BY position, id', t.checklist_key, t.stage, t.parent_id);
       const i = sibs.findIndex((s) => s.id === t.id),j = i + (body.move < 0 ? -1 : 1);
       if (j >= 0 && j < sibs.length) {[sibs[i], sibs[j]] = [sibs[j], sibs[i]];await forEachAsync(sibs, async (s, k) => await run('UPDATE checklist_templates SET position = ? WHERE id = ?', k, s.id));}
     }
@@ -1216,7 +1236,7 @@ async function createCore({ db, platform }) {
       if (scope === 'forme') {where.push('c.for_user_id = ?');p.push(me.id);}
     }
     if (q.matter) {where.push('c.matter_id = ?');p.push(+q.matter);}
-    if (q.q) {where.push('(c.caller_name LIKE ? OR c.phone LIKE ? OR c.company LIKE ? OR c.message LIKE ? OR m.code LIKE ?)');const l = `%${q.q}%`;p.push(l, l, l, l, l);}
+    if (q.q) {where.push('(c.caller_name ILIKE ? OR c.phone ILIKE ? OR c.company ILIKE ? OR c.message ILIKE ? OR m.code ILIKE ?)');const l = `%${q.q}%`;p.push(l, l, l, l, l);}
     const order = scope === 'done' ? 'c.completed_at DESC LIMIT 200' : "(c.priority = 'urgent') DESC, (c.due_at IS NULL) DESC, c.due_at, c.id";
     return await qa(`${cbSelect} WHERE ${where.join(' AND ')} ORDER BY ${order}`, ...p);
   });
@@ -1224,7 +1244,7 @@ async function createCore({ db, platform }) {
   on('GET', '/api/callers', async ({ query }) => {
     const s = String(query.q || '').trim();if (s.length < 2) return [];
     const l = `%${s}%`;
-    return await qa(`SELECT caller_name, phone, email, company, matter_id, MAX(created_at) AS last FROM callbacks WHERE caller_name LIKE ? OR phone LIKE ? GROUP BY caller_name, phone ORDER BY last DESC LIMIT 8`, l, l);
+    return await qa(`SELECT * FROM (SELECT DISTINCT ON (caller_name, phone) caller_name, phone, email, company, matter_id, created_at AS last FROM callbacks WHERE caller_name ILIKE ? OR phone ILIKE ? ORDER BY caller_name, phone, created_at DESC, id ASC) recent ORDER BY last DESC LIMIT 8`, l, l);
   });
   on('POST', '/api/callbacks', async ({ me, body }) => {
     const f = cbFields(body);
@@ -1332,20 +1352,26 @@ async function createCore({ db, platform }) {
   });
   on('GET', '/api/poll', async ({ me }) => {
     if (platform.runJobsOnPoll) await runJobs();
-    const unread = (await q1('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND read = 0', me.id)).n;
-    const v = (await q1(`SELECT (SELECT COALESCE(MAX(updated_at),'') FROM tasks) || '|' || (SELECT COUNT(*) FROM tasks) || '|' ||
-      (SELECT COALESCE(MAX(updated_at),'') FROM matters) || '|' || (SELECT COUNT(*) FROM matters) || '|' || (SELECT COALESCE(MAX(id),0) FROM activity) AS v`)).v;
-    const cb = await q1("SELECT COUNT(*) AS n, SUM(CASE WHEN due_at IS NULL OR due_at <= ? THEN 1 ELSE 0 END) AS due FROM callbacks WHERE status = 'open' AND assignee_id = ?", nowMin(), me.id);
-    const cbv = (await q1("SELECT COALESCE(MAX(updated_at),'') || '|' || COUNT(*) || '|' || (SELECT COUNT(*) || ':' || COALESCE(MAX(id),0) || ':' || COALESCE(SUM(LENGTH(start_date || end_date || kind)),0) FROM leave) || '|' || (SELECT COUNT(*) FROM holidays) AS v FROM callbacks")).v;
-    return { unread, version: v + '|' + cbv, callbacks_open: cb.n || 0, callbacks_due: cb.due || 0 };
+    const r = await q1(`SELECT
+      (SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read = 0) AS unread,
+      (SELECT COALESCE(MAX(updated_at),'') FROM tasks) || '|' || (SELECT COUNT(*) FROM tasks) || '|' ||
+      (SELECT COALESCE(MAX(updated_at),'') FROM matters) || '|' || (SELECT COUNT(*) FROM matters) || '|' ||
+      (SELECT COALESCE(MAX(id),0) FROM activity) || '|' ||
+      (SELECT COALESCE(MAX(updated_at),'') || '|' || COUNT(*) FROM callbacks) || '|' ||
+      (SELECT COUNT(*) || ':' || COALESCE(MAX(id),0) || ':' || COALESCE(SUM(LENGTH(start_date || end_date || kind)),0) FROM leave) || '|' ||
+      (SELECT COUNT(*) FROM holidays) AS version,
+      COUNT(*) AS callbacks_open,
+      COALESCE(SUM(CASE WHEN due_at IS NULL OR due_at <= ? THEN 1 ELSE 0 END),0) AS callbacks_due
+      FROM callbacks WHERE status = 'open' AND assignee_id = ?`, me.id, nowMin(), me.id);
+    return r;
   });
   on('GET', '/api/search', async ({ me, query }) => {
     const s = String(query.q || '').trim();if (!s) return { tasks: [], matters: [] };
     const l = `%${s}%`;
     const hideM = canTax(me) ? '' : ` AND type NOT IN ${TAX_IN}`,hideT = canTax(me) ? '' : ` AND (m.type IS NULL OR m.type NOT IN ${TAX_IN})`;
     return {
-      matters: (await qa(`SELECT id, code, type, address, client, status, settlement_date FROM matters WHERE (code LIKE ? OR address LIKE ? OR client LIKE ?)${hideM} ORDER BY code, type LIMIT 12`, l, l, l)).map((m) => ({ ...m, name: matterName(m) })),
-      tasks: await qa(`${TASK_SELECT} WHERE (t.title LIKE ? OR t.description LIKE ? OR m.code LIKE ? OR m.client LIKE ?)${hideT} ORDER BY (t.status = 'done'), t.due_date LIMIT 20`, l, l, l, l)
+      matters: (await qa(`SELECT id, code, type, address, client, status, settlement_date FROM matters WHERE (code ILIKE ? OR address ILIKE ? OR client ILIKE ?)${hideM} ORDER BY code, type LIMIT 12`, l, l, l)).map((m) => ({ ...m, name: matterName(m) })),
+      tasks: await qa(`${TASK_SELECT} WHERE (t.title ILIKE ? OR t.description ILIKE ? OR m.code ILIKE ? OR m.client ILIKE ?)${hideT} ORDER BY (t.status = 'done'), t.due_date LIMIT 20`, l, l, l, l)
     };
   });
 
@@ -1433,11 +1459,11 @@ async function createCore({ db, platform }) {
     if (!since) return [];
     const hide = canTax(me) ? '' : ` AND (m.type IS NULL OR m.type NOT IN ${TAX_IN})`;
     const tasks = (await qa(`SELECT t.id, t.title, t.status, m.code, m.type, MAX(a.created_at) AS at FROM activity a JOIN tasks t ON t.id = a.task_id LEFT JOIN matters m ON m.id = t.matter_id
-      WHERE a.user_id = ? AND a.created_at >= ?${hide} GROUP BY t.id ORDER BY at DESC LIMIT 12`, me.id, since)).
+      WHERE a.user_id = ? AND a.created_at >= ?${hide} GROUP BY t.id, m.code, m.type ORDER BY at DESC LIMIT 12`, me.id, since)).
     map((t) => ({ task_id: t.id, label: `${t.code ? t.code + ' ' + ((W.TYPE[t.type] || {}).short || '') + ' – ' : ''}${t.title}${t.status === 'done' ? ' (done)' : ''}` }));
     const matters = (await qa(`SELECT m.id, m.code, m.type, m.client, COUNT(*) AS n, MAX(a.created_at) AS at FROM activity a JOIN matters m ON m.id = a.matter_id WHERE a.user_id = ? AND a.created_at >= ? AND a.task_id IS NULL${hide} GROUP BY m.id ORDER BY at DESC LIMIT 8`, me.id, since)).
     map((m) => ({ label: `${m.code} ${(W.TYPE[m.type] || {}).short || ''} ${m.client || ''} – checklist updates (${m.n})`.replace(/\s+/g, ' ') }));
-    const calls = (await qa(`SELECT c.caller_name, l.kind, MAX(l.created_at) AS at FROM callback_log l JOIN callbacks c ON c.id = l.callback_id WHERE l.user_id = ? AND l.created_at >= ? AND l.kind IN ('attempt','done') GROUP BY c.id ORDER BY at DESC LIMIT 6`, me.id, since)).
+    const calls = (await qa(`SELECT caller_name, kind, at FROM (SELECT DISTINCT ON (c.id) c.caller_name, l.kind, l.created_at AS at FROM callback_log l JOIN callbacks c ON c.id = l.callback_id WHERE l.user_id = ? AND l.created_at >= ? AND l.kind IN ('attempt','done') ORDER BY c.id, l.created_at DESC, l.id ASC) recent ORDER BY at DESC LIMIT 6`, me.id, since)).
     map((c) => ({ label: `Called back ${c.caller_name}` }));
     return [...tasks, ...matters, ...calls];
   }
@@ -1484,10 +1510,17 @@ async function createCore({ db, platform }) {
     const from = validDate(q.from) || addDays(today(), -6),to = validDate(q.to) || today();
     const uid = me.role === 'admin' ? q.user ? +q.user : null : me.id;
     const users = await qa(`SELECT id, name FROM users WHERE ${uid ? 'id = ?' : 'active = 1 OR id IN (SELECT user_id FROM time_entries WHERE clock_in BETWEEN ? AND ?)'} ORDER BY name`, ...(uid ? [uid] : [from + ' 00:00:00', to + ' 23:59:59']));
-    const out = await mapAsync(users, async (u) => {
-      const entries = await qa('SELECT * FROM time_entries WHERE user_id = ? AND clock_in BETWEEN ? AND ? ORDER BY clock_in', u.id, from + ' 00:00:00', to + ' 23:59:59');
-      const logs = await qa('SELECT id, at, since, text, kind, task_ids FROM work_logs WHERE user_id = ? AND at BETWEEN ? AND ? ORDER BY at', u.id, from + ' 00:00:00', to + ' 23:59:59');
-      const leaves = (await qa('SELECT * FROM leave WHERE user_id = ? AND end_date >= ? AND start_date <= ?', u.id, from, to)).map((l) => pubLeave(l, me));
+    const ids = users.map(u => u.id), start = from + ' 00:00:00', end = to + ' 23:59:59';
+    const data = await q1(`SELECT
+      ${jsonRows('SELECT * FROM time_entries WHERE user_id = ANY(?::bigint[]) AND clock_in BETWEEN ? AND ? ORDER BY clock_in')} AS entries,
+      ${jsonRows('SELECT id, user_id, at, since, text, kind, task_ids FROM work_logs WHERE user_id = ANY(?::bigint[]) AND at BETWEEN ? AND ? ORDER BY at')} AS logs,
+      ${jsonRows('SELECT * FROM leave WHERE user_id = ANY(?::bigint[]) AND end_date >= ? AND start_date <= ?')} AS leaves,
+      ${jsonRows('SELECT * FROM holidays WHERE date BETWEEN ? AND ? ORDER BY date')} AS holidays`, ids, start, end, ids, start, end, ids, from, to, from, to);
+    const entryGroups = groupBy(data.entries, 'user_id'), logGroups = groupBy(data.logs, 'user_id'), leaveGroups = groupBy(data.leaves, 'user_id');
+    const out = await mapAsync(users, async u => {
+      const entries = entryGroups.get(u.id) || [];
+      const logs = (logGroups.get(u.id) || []).map(({ user_id, ...row }) => row);
+      const leaves = (leaveGroups.get(u.id) || []).map(l => pubLeave(l, me));
       const days = [];
       for (let d = from; d <= to; d = addDays(d, 1)) {
         const es = entries.filter((x) => x.clock_in.slice(0, 10) === d).map((x) => ({ ...x, minutes: minsBetween(x.clock_in, x.clock_out || now()), open: !x.clock_out }));
@@ -1497,7 +1530,7 @@ async function createCore({ db, platform }) {
       }
       return { user_id: u.id, name: u.name, days, minutes: days.reduce((n, x) => n + x.minutes, 0) };
     });
-    return { from, to, users: out, holidays: await qa('SELECT * FROM holidays WHERE date BETWEEN ? AND ? ORDER BY date', from, to) };
+    return { from, to, users: out, holidays: data.holidays };
   });
   function entryFields(b) {
     const o = {};
@@ -1568,8 +1601,7 @@ async function createCore({ db, platform }) {
     try {
       let me = null;
       if (!r.open) {
-        const s = token ? await q1('SELECT * FROM sessions WHERE token = ?', token) : null;
-        if (s && s.expires_at >= now()) me = await userById(s.user_id);
+        me = token ? await q1('SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.expires_at >= ?', token, now()) : null;
         if (!me || !me.active) return { status: 401, body: { error: 'Your session expired. Sign in again.' } };
       }
       if (me) await guardRoute(me, path, params, body || {});
@@ -1577,7 +1609,7 @@ async function createCore({ db, platform }) {
       return { status: 200, body: out };
     } catch (e) {
       if (!e.status) console.error(e);
-      return { status: e.status || 500, body: { error: e.status ? e.message : 'Something went wrong. Try again.' } };
+      return { status: e.status || 500, commitOnError: !!e.commitOnError, body: { error: e.status ? e.message : 'Something went wrong. Try again.' } };
     }
   }
   function guessMime(name, given) {
@@ -1586,7 +1618,8 @@ async function createCore({ db, platform }) {
     return given || 'application/octet-stream';
   }
 
-  return { handle, runJobs, getSetting, setSetting, routes, ensureLibrary: async () => await ensureLibrary(db), uploadField: (path) => {const r = routes.find((x) => x.method === 'POST' && x.re.test(path));return r && r.upload;} };
+  const isReadOnly = (method, path) => (method === 'GET' && !/^\/api\/attachments\/[^/]+\/parts$/.test(path)) || path === '/api/backup';
+  return { isReadOnly, handle, runJobs, getSetting, setSetting, routes, ensureLibrary: async () => await ensureLibrary(db), uploadField: (path) => {const r = routes.find((x) => x.method === 'POST' && x.re.test(path));return r && r.upload;} };
 }
 
 

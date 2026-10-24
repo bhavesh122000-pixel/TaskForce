@@ -29,3 +29,9 @@ Desktop.ini
 .vscode/
 *.tmp
 .scratch/
+
+# Local documentation and handover reports
+[Rr][Ee][Aa][Dd][Mm][Ee]*
+/SUPABASE.md
+/PERFORMANCE.md
+/TaskForce-Handover.pdf

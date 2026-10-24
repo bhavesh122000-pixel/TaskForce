@@ -150,8 +150,7 @@ async function boot() {
     if (r.status === 401) return renderLogin(st.firm);
     const me = await r.json();
     S.me = me.user; S.firm = me.firm; S.mailConfigured = me.mailConfigured;
-    await loadRefs();
-    if (window.loadPeopleDates) await loadPeopleDates();
+    await Promise.all([loadRefs(), window.loadPeopleDates ? loadPeopleDates() : Promise.resolve()]);
     renderShell();
     route();
     startPolling();

@@ -5,37 +5,21 @@ const { connectionOptions } = require('./connection');
 const TABLES = ['users', 'sessions', 'matters', 'matter_items', 'checklist_templates', 'tasks', 'checklist_items', 'notes', 'activity', 'attachments', 'callbacks', 'notifications', 'checklists', 'checklist_stages', 'matter_stages', 'settings', 'email_parts', 'file_tokens', 'holidays', 'leave', 'time_entries', 'work_logs', 'login_codes', 'callback_log'];
 const IDS = new Set(TABLES.filter(t => !['sessions', 'settings', 'file_tokens'].includes(t)));
 
-// Translate the engine's SQLite placeholders and small dialect differences.
-// Quoted values are protected before rewriting identifiers or operators.
-function translate(sql, schema = 'taskforce_app') {
+// Parameter binding and schema qualification for application SQL. The query
+// sources use PostgreSQL syntax; values are always passed separately to pg.
+function compileSql(sql, schema = 'taskforce_app') {
   const literals = [];
   let text = sql.replace(/'(?:''|[^'])*'/g, value => `__TF_LITERAL_${literals.push(value) - 1}__`);
-  // SQLite's MAX row is used for repeat-caller suggestions and recent activity.
-  if (/SELECT caller_name, phone, email, company, matter_id, MAX\(created_at\) AS last/i.test(text)) {
-    text = text.replace(/SELECT caller_name, phone, email, company, matter_id, MAX\(created_at\) AS last FROM callbacks WHERE ([\s\S]+) GROUP BY caller_name, phone ORDER BY last DESC LIMIT 8/i,
-      'SELECT * FROM (SELECT DISTINCT ON (caller_name, phone) caller_name, phone, email, company, matter_id, created_at AS last FROM callbacks WHERE $1 ORDER BY caller_name, phone, created_at DESC, id ASC) recent ORDER BY last DESC LIMIT 8');
-  }
-  text = text.replace(/GROUP BY t\.id ORDER BY at DESC/i, 'GROUP BY t.id, m.code, m.type ORDER BY at DESC');
-  if (/SELECT c\.caller_name, l\.kind, MAX\(l\.created_at\) AS at/i.test(text)) {
-    text = text.replace(/SELECT c\.caller_name, l\.kind, MAX\(l\.created_at\) AS at FROM callback_log l JOIN callbacks c ON c\.id = l\.callback_id WHERE ([\s\S]+) GROUP BY c\.id ORDER BY at DESC LIMIT 6/i,
-      'SELECT caller_name, kind, at FROM (SELECT DISTINCT ON (c.id) c.caller_name, l.kind, l.created_at AS at FROM callback_log l JOIN callbacks c ON c.id = l.callback_id WHERE $1 ORDER BY c.id, l.created_at DESC, l.id ASC) recent ORDER BY at DESC LIMIT 6');
-  }
   let index = 0;
   text = text.replace(/\?/g, () => `$${++index}`);
-  text = text.replace(/\bIS\s+(\$\d+)/gi, 'IS NOT DISTINCT FROM $1');
-  text = text.replace(/\bLIKE\b/gi, 'ILIKE');
-  // Preserve COLLATE NOCASE equality for the original email and matter code.
-  const where = text.search(/\bWHERE\b/i);
-  if (where >= 0) text = text.slice(0, where) + text.slice(where).replace(/\b((?:\w+\.)?(?:email|code))\s*(=|<>|!=)\s*(\$\d+)/gi, 'lower($1) $2 lower($3)');
-  text = sqliteNullOrder(text);
+  text = explicitNullOrder(text);
   const names = [...TABLES, 'upload_grants'].join('|');
   text = text.replace(new RegExp(`\\b(FROM|JOIN|UPDATE|INTO)\\s+(${names})\\b`, 'gi'), (_, keyword, name) => `${keyword} "${schema}"."${name.toLowerCase()}"`);
   return text.replace(/__TF_LITERAL_(\d+)__/g, (_, i) => literals[+i]);
 }
 
-function sqliteNullOrder(text) {
-  // SQLite sorts NULL first in ascending order and last in descending order.
-  // Track parentheses so nested ORDER BY clauses and expressions stay intact.
+// Keep the application's established ordering explicit in PostgreSQL.
+function explicitNullOrder(text) {
   const pattern = /\bORDER\s+BY\s+/gi;
   const edits = [];
   let match;
@@ -46,7 +30,7 @@ function sqliteNullOrder(text) {
       if (item && !/\bNULLS\s+(FIRST|LAST)\b/i.test(item)) edits.push({ at: end, value: /\bDESC\s*$/i.test(item) ? ' NULLS LAST' : ' NULLS FIRST' });
     };
     for (; i < text.length; i++) {
-      if (depth === 0 && (text[i] === ')' || /^(?:LIMIT|OFFSET|FETCH|FOR)\b/i.test(text.slice(i)))) { finish(i); break; }
+      if (depth === 0 && (text[i] === ')' || /^(?:LIMIT|OFFSET|FETCH|FOR|RETURNING)\b/i.test(text.slice(i)))) { finish(i); break; }
       if (text[i] === '(') depth++;
       else if (text[i] === ')') depth--;
       else if (text[i] === ',' && depth === 0) { finish(i); start = i + 1; }
@@ -71,27 +55,49 @@ function normalize(result) {
 function createPostgres({ connectionString = process.env.DATABASE_URL, pool, schema = process.env.SUPABASE_DB_SCHEMA || 'taskforce_app', timezone = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone } = {}) {
   if (!/^[a-z_][a-z0-9_]*$/.test(schema)) throw new Error('Invalid SUPABASE_DB_SCHEMA.');
   if (!pool && !connectionString) throw new Error('Set DATABASE_URL to the Supabase PostgreSQL connection string in .env.local.');
-  const connections = pool || new Pool({ ...connectionOptions(connectionString), max: 3, idleTimeoutMillis: 10000 });
-  const context = new AsyncLocalStorage();
+  const max = Math.min(20, Math.max(2, parseInt(process.env.PG_POOL_MAX || '5', 10) || 5));
+  const connections = pool || new Pool({ ...connectionOptions(connectionString), max, idleTimeoutMillis: 30000 });
+  connections.on?.('error', error => console.error('[postgres pool]', error.code || error.message));
+  const context = new AsyncLocalStorage(), compiled = new Map();
+  function sqlText(sql) {
+    if (!compiled.has(sql)) {
+      if (compiled.size >= 1000) compiled.clear();
+      compiled.set(sql, compileSql(sql, schema));
+    }
+    return compiled.get(sql);
+  }
   async function query(sql, params = []) {
     const current = context.getStore();
     if (!current) throw new Error('Database queries must run inside withConnection().');
-    return normalize(await current.client.query(translate(sql, schema), params));
+    if (current.readOnly && !/^\s*(SELECT|WITH)\b/i.test(sql)) throw new Error('A read-only request attempted to modify the database.');
+    const client = current.client || await connections.connect();
+    try { return normalize(await client.query(sqlText(sql), params)); }
+    finally { if (!current.client) client.release(); }
   }
-  return {
+  const db = {
     dialect: 'postgres', schema,
-    async withConnection(callback) {
-      if (context.getStore()) return callback();
+    // The cache belongs to one request, so permission/settings changes are visible
+    // to the next request. Writes invalidate it inside the current request too.
+    memo(key, loader) {
+      const current = context.getStore();
+      if (!current) return loader();
+      if (!current.cache.has(key)) current.cache.set(key, Promise.resolve().then(loader));
+      return current.cache.get(key);
+    },
+    async withConnection(callback, { readOnly = false, independent = false } = {}) {
+      if (context.getStore() && !independent) return callback();
+      if (readOnly) return context.run({ readOnly: true, cache: new Map() }, callback);
       const client = await connections.connect();
+      const current = { client, readOnly: false, savepoints: [], cache: new Map() };
       try {
         await client.query('BEGIN');
-        await client.query("SELECT set_config('TimeZone', $1, true)", [timezone]);
-        // Keep each engine operation in the same order as the original single
-        // office database, including across different serverless instances.
-        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [schema]);
-        const result = await context.run({ client, savepoints: [] }, callback);
-        const commit = await client.query('COMMIT');
-        if (commit.command === 'ROLLBACK') throw new Error('The database transaction could not be committed.');
+        // Writes retain cross-process ordering for multi-record business rules.
+        // Ordinary page reads do not take this lock or hold a transaction open.
+        await client.query("SELECT set_config('TimeZone', $1, true), pg_advisory_xact_lock(hashtextextended($2, 0))", [timezone, schema]);
+        const result = await context.run(current, callback);
+        const rejected = result?.status >= 400 && !result.commitOnError;
+        const commit = await client.query(rejected ? 'ROLLBACK' : 'COMMIT');
+        if (!rejected && commit.command === 'ROLLBACK') throw new Error('The database transaction could not be committed.');
         return result;
       } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error; }
       finally { client.release(); }
@@ -101,6 +107,9 @@ function createPostgres({ connectionString = process.env.DATABASE_URL, pool, sch
         async get(...params) { return (await query(sql, params)).rows[0]; },
         async all(...params) { return (await query(sql, params)).rows; },
         async run(...params) {
+          const current = context.getStore();
+          if (current?.readOnly) throw new Error('A read-only request attempted to modify the database.');
+          current?.cache.clear();
           const table = /^\s*INSERT\s+INTO\s+(\w+)/i.exec(sql)?.[1]?.toLowerCase();
           const withId = IDS.has(table) && !/\bRETURNING\b/i.test(sql);
           const result = await query(sql + (withId ? ' RETURNING id' : ''), params);
@@ -108,9 +117,26 @@ function createPostgres({ connectionString = process.env.DATABASE_URL, pool, sch
         },
       };
     },
+    async reserveIds(table, count) {
+      if (!IDS.has(table) || !Number.isSafeInteger(count) || count < 0) throw new Error('Invalid ID allocation.');
+      if (context.getStore()?.readOnly) throw new Error('ID allocation requires a write transaction.');
+      if (!count) return [];
+      return (await query('SELECT nextval(pg_get_serial_sequence(?, \'id\')) AS id FROM generate_series(1, ?::int)', [`${schema}.${table}`, count])).rows.map(row => row.id);
+    },
+    async insertMany(table, columns, rows) {
+      if (!TABLES.includes(table) || columns.some(column => !/^[a-z_]+$/.test(column))) throw new Error('Invalid bulk insert target.');
+      if (context.getStore()?.readOnly) throw new Error('Bulk inserts require a write transaction.');
+      context.getStore()?.cache.clear();
+      for (let start = 0; start < rows.length; start += 500) {
+        const batch = rows.slice(start, start + 500);
+        if (batch.some(row => row.length !== columns.length)) throw new Error('Invalid bulk insert row.');
+        await query(`INSERT INTO ${table} (${columns.map(column => `"${column}"`).join(',')}) VALUES ${batch.map(() => '(' + columns.map(() => '?').join(',') + ')').join(',')}`, batch.flat());
+      }
+    },
     async exec(sql) {
       const current = context.getStore();
-      if (!current) throw new Error('Database exec requires withConnection().');
+      if (!current?.client || current.readOnly) throw new Error('Database exec requires a write transaction.');
+      current.cache.clear();
       const command = sql.trim().replace(/;$/, '').toUpperCase();
       if (command === 'BEGIN') {
         const name = `tf_${current.savepoints.length + 1}`;
@@ -126,5 +152,6 @@ function createPostgres({ connectionString = process.env.DATABASE_URL, pool, sch
     },
     close: () => connections.end(),
   };
+  return db;
 }
-module.exports = { createPostgres, translate, TABLES };
+module.exports = { createPostgres, compileSql, TABLES };

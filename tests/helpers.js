@@ -4,7 +4,7 @@ const crypto = require('node:crypto');
 const { PGlite } = require('@electric-sql/pglite');
 const { createPostgres } = require('../backend/postgres');
 
-async function database() {
+async function database({ onQuery = () => {}, delay = () => 0 } = {}) {
   const pg = new PGlite();
   await pg.exec('CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role BYPASSRLS;');
   for (const file of ['setup.sql', 'connect.sql']) await pg.exec(fs.readFileSync(path.join(__dirname, '..', 'supabase', file), 'utf8'));
@@ -13,7 +13,7 @@ async function database() {
     async connect() {
       const previous = tail; let release;
       tail = new Promise(resolve => { release = resolve; }); await previous;
-      return { async query(sql, parameters) { const result = await pg.query(sql, parameters); return { ...result, rowCount: result.affectedRows, command: '' }; }, release };
+      return { async query(sql, parameters) { onQuery(sql); const ms = delay(); if (ms) await new Promise(resolve => setTimeout(resolve, ms)); const result = await pg.query(sql, parameters); return { ...result, rowCount: result.affectedRows, command: '' }; }, release };
     },
     end: () => pg.close(),
   };

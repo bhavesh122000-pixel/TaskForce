@@ -1,21 +1,18 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { DatabaseSync } = require('node:sqlite');
-const { wrapSqlite } = require('../backend/sqlite');
 const { createCore } = require('../core/api');
 const { passwords } = require('../backend/platform');
 const { database } = require('./helpers');
 
-for (const backend of ['sqlite', 'postgres']) test(`${backend}: existing workflow and permission regression`, async () => {
-  const db = backend === 'sqlite' ? wrapSqlite(new DatabaseSync(':memory:')) : await database();
+test('postgres: existing workflow and permission regression', async () => {
+  const db = await database();
   const platform = { ...passwords, mailConfigured: async () => false, supportsLoginCodes: true };
   const core = await db.withConnection(() => createCore({ db, platform }));
-  const call = (method, path, body = {}, token = null, query = {}) => db.withConnection(() => core.handle({ method, path, body, token, query }));
+  const call = (method, path, body = {}, token = null, query = {}) => db.withConnection(() => core.handle({ method, path, body, token, query }), { readOnly: core.isReadOnly(method, path) });
   const good = async (...args) => { const result = await call(...args); assert.equal(result.status, 200, `${args[0]} ${args[1]}: ${JSON.stringify(result.body)}`); return result.body; };
   try {
     const password = 'integration-password';
-    if (backend === 'sqlite') await good('POST', '/api/setup', { name: 'Bhavesh', email: 'bhavesh122000@gmail.com', password });
-    else await db.withConnection(async () => db.prepare('UPDATE users SET password_hash = ? WHERE id = 1').run(await passwords.hashPassword(password)));
+    await db.withConnection(async () => db.prepare('UPDATE users SET password_hash = ? WHERE id = 1').run(await passwords.hashPassword(password)));
     const admin = (await good('POST', '/api/login', { email: 'BHAVESH122000@gmail.com', password }))._session;
     const employee = await good('POST', '/api/users', { name: 'Employee', email: 'employee@example.com', password }, admin);
     const staff = (await good('POST', '/api/login', { email: employee.email, password }))._session;

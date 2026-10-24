@@ -2,7 +2,9 @@ name: TaskForce scheduled jobs
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    # Offset from the busiest minute at the start of the hour.
+    # GitHub can delay scheduled runs; this is not an uptime guarantee.
+    - cron: '3-58/5 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -15,18 +17,56 @@ concurrency:
 jobs:
   run-scheduled-jobs:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 7
     steps:
-      - name: Call TaskForce cron endpoint
+      - name: Run jobs and verify the application response
         env:
           TASKFORCE_URL: ${{ vars.TASKFORCE_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
         run: |
-          set -euo pipefail
-          if [[ -z "$TASKFORCE_URL" || -z "$CRON_SECRET" ]]; then
-            echo "Set the TASKFORCE_URL variable and CRON_SECRET secret in GitHub Actions settings."
-            exit 1
-          fi
-          curl --fail --silent --show-error --max-time 240 \
-            -H "Authorization: Bearer ${CRON_SECRET}" \
-            "${TASKFORCE_URL%/}/api/cron"
+          node <<'NODE'
+          (async () => {
+            const base = process.env.TASKFORCE_URL?.trim();
+            const secret = process.env.CRON_SECRET;
+            if (!base || !secret) throw new Error('Set the TASKFORCE_URL variable and CRON_SECRET secret in GitHub Actions settings.');
+            const url = new URL(base);
+            if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || !['', '/'].includes(url.pathname)) {
+              throw new Error('TASKFORCE_URL must be the HTTPS site address, without credentials, a path or query parameters.');
+            }
+            url.pathname = '/api/cron';
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              const started = Date.now();
+              console.log(`${new Date().toISOString()} — application check ${attempt}/3`);
+              let failure;
+              try {
+                const response = await fetch(url, {
+                  headers: { Authorization: `Bearer ${secret}`, Accept: 'application/json' },
+                  signal: AbortSignal.timeout(90000),
+                  redirect: 'error',
+                });
+                console.log(`HTTP ${response.status}; ${Date.now() - started} ms`);
+                if ([401, 403].includes(response.status)) {
+                  await response.body?.cancel();
+                  throw Object.assign(new Error('Access refused. Check that CRON_SECRET matches Render and the URL points to TaskForce.'), { permanent: true });
+                }
+                if (response.status === 404) {
+                  await response.body?.cancel();
+                  throw Object.assign(new Error('The /api/cron endpoint was not found. Check TASKFORCE_URL and the deployed version.'), { permanent: true });
+                }
+                const body = await response.json().catch(() => null);
+                if (response.status === 200 && body?.ok === true) {
+                  console.log(`Verified TaskForce JSON response${body.skipped ? '; jobs already ran in this clock window' : '; scheduled jobs completed'}.`);
+                  return;
+                }
+                failure = `The app did not return HTTP 200 with {"ok":true} (HTTP ${response.status}). A loading page is not counted as success.`;
+              } catch (error) {
+                if (error.permanent) throw error;
+                // Log no response bodies, headers or environment values.
+                failure = 'Request failed or timed out while contacting the application.';
+              }
+              console.warn(failure);
+              if (attempt < 3) await new Promise(resolve => setTimeout(resolve, attempt * 10000));
+            }
+            throw new Error('TaskForce could not be verified after three attempts. Check Render logs and the next scheduled run.');
+          })().catch(error => { console.error(error.message); process.exitCode = 1; });
+          NODE
