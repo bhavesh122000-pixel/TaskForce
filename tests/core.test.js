@@ -3,12 +3,13 @@ const assert = require('node:assert/strict');
 const { createCore } = require('../core/api');
 const { passwords } = require('../backend/platform');
 const { database } = require('./helpers');
+const { requestOptions } = require('../backend/locks');
 
 test('postgres: existing workflow and permission regression', async () => {
   const db = await database();
   const platform = { ...passwords, mailConfigured: async () => false, supportsLoginCodes: true };
   const core = await db.withConnection(() => createCore({ db, platform }));
-  const call = (method, path, body = {}, token = null, query = {}) => db.withConnection(() => core.handle({ method, path, body, token, query }), { readOnly: core.isReadOnly(method, path) });
+  const call = (method, path, body = {}, token = null, query = {}) => db.withConnection(() => core.handle({ method, path, body, token, query }), requestOptions(db, core, { method, path, body, token }));
   const good = async (...args) => { const result = await call(...args); assert.equal(result.status, 200, `${args[0]} ${args[1]}: ${JSON.stringify(result.body)}`); return result.body; };
   try {
     const password = 'integration-password';

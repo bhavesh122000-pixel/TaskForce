@@ -309,14 +309,14 @@ function route() {
   $$('.nav a').forEach(x => x.classList.toggle('on', x.dataset.r === r));
   const main = $('#main');
   if (!main) return;
-  ({
+  return ({
     board: renderBoard, list: renderList, calendar: renderCalendar, matters: a ? () => renderMatter(+a, b) : () => renderMatters('conv'),
     tax: () => (S.me.can_tax ? renderMatters('tax') : renderBoard()),
     time: () => renderTime(),
     readiness: renderReadiness, settlements: renderReadiness, callbacks: () => renderCallbacks(a ? +a : null), admin: () => renderAdmin(a || 'users'),
   }[r] || renderBoard)();
 }
-function refreshView() { route(); }
+function refreshView() { return route(); }
 
 /* ---------------- filters shared by board/list/calendar ---------------- */
 function getFilter() { return store('filter') || { scope: 'all', person: '' }; }
@@ -751,27 +751,60 @@ async function openNotif(id, taskId, matterId, callbackId) {
 async function readAll() { try { await api('POST', '/api/notifications/read', {}); $('#notifPanel').classList.add('hidden'); poll(); } catch (e) { errToast(e); } }
 
 /* ---------------- polling ---------------- */
-let pollTimer = null;
-function startPolling() { stopPolling(); poll(); pollTimer = setInterval(poll, 20000); }
-function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = null; }
-async function poll() {
-  if (!S.me) return;
+let pollTimer = null, pollFlight = null, polling = false, pollGeneration = 0;
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  if (polling) pollTimer = setTimeout(() => { poll().finally(schedulePoll); }, (document.hidden ? 60000 : 20000) + Math.random() * 5000);
+}
+function startPolling() { stopPolling(); polling = true; pollTimer = setTimeout(() => { poll().finally(schedulePoll); }, Math.random() * 3000); }
+function stopPolling() { polling = false; pollGeneration++; clearTimeout(pollTimer); pollTimer = null; S.pollVersions = null; }
+document.addEventListener('visibilitychange', () => {
+  if (polling) { clearTimeout(pollTimer); if (!document.hidden) poll().finally(schedulePoll); else schedulePoll(); }
+});
+function poll() {
+  if (!S.me) return Promise.resolve();
+  if (pollFlight) return pollFlight;
+  const generation = pollGeneration;
+  pollFlight = performPoll(generation).finally(() => { pollFlight = null; });
+  return pollFlight;
+}
+async function performPoll(generation) {
   try {
     const r = await api('GET', '/api/poll');
+    if (generation !== pollGeneration || !S.me) return;
     const c = $('#bellCount');
     if (c) { c.textContent = r.unread > 99 ? '99+' : r.unread; c.classList.toggle('hidden', !r.unread); }
     document.title = (r.unread ? `(${r.unread}) ` : '') + 'TaskForce';
-    if (window.afterPoll) afterPoll(r);
-    if (S.version && r.version !== S.version) {
+    if (window.afterPoll) await afterPoll(r);
+    const previous = S.pollVersions;
+    const legacyChange = !r.versions && S.version && r.version !== S.version;
+    const changed = key => legacyChange || !!(previous && r.versions && previous[key] !== r.versions[key]);
+    if (legacyChange || (previous && Object.keys(r.versions || {}).some(changed))) {
       const typing = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
-      if (!$('#modal') && !typing) {
-        try { S.matters = await api('GET', '/api/matters?status=all&brief=1'); } catch { /* ignore */ }
-        if (window.loadPeopleDates) { await loadPeopleDates(); refreshTime(); }
-        if (!document.querySelector('.tcard.dragging, .oc-dragging, .oc-preview')) { S.calKeepScroll = true; refreshView(); }
-        if ($('#drawer') && S.drawerTaskId) { try { drawDrawer(await api('GET', '/api/tasks/' + S.drawerTaskId)); } catch { closeDrawer(); } }
+      if (!document.hidden && !$('#modal') && !typing && !document.querySelector('.tcard.dragging, .oc-dragging, .oc-preview')) {
+        const updates = [];
+        if (changed('matterRefs')) updates.push(api('GET', '/api/matters?status=all&brief=1').then(rows => { S.matters = rows; }));
+        if (changed('users')) updates.push(Promise.all([api('GET','/api/users'), api('GET','/api/me')]).then(([users, me]) => { S.users = users; S.me = me.user; S.firm = me.firm; }));
+        if (changed('people') && window.loadPeopleDates) updates.push(loadPeopleDates());
+        if ((changed('time') || changed('settings')) && window.refreshTime) updates.push(refreshTime());
+        await Promise.all(updates);
+        const [screen, tab] = (location.hash.replace(/^#\/?/, '') || 'board').split('/');
+        const relevant = {
+          board:['tasks','users','matterRefs','people'], list:['tasks','users','matterRefs','people'],
+          calendar:['tasks','matters','callbacks','people','users','library'],
+          matters:['matters','tasks','users','people','library'], tax:['matters','tasks','users','people','library'],
+          readiness:['matters','tasks','users','people','library'], settlements:['matters','tasks','users','people','library'],
+          callbacks:['callbacks','users','matterRefs'], time:['time','users','people','settings'],
+          admin:tab === 'users' ? ['users'] : tab === 'checklists' ? ['library','matters'] : tab === 'time' ? ['people','time','settings'] : ['settings'],
+        };
+        if (legacyChange || (relevant[screen] || ['tasks','matters']).some(changed)) { S.calKeepScroll = true; await refreshView(); }
+        if ($('#drawer') && S.drawerTaskId && ['tasks','users','matterRefs'].some(changed)) {
+          try { drawDrawer(await api('GET', '/api/tasks/' + S.drawerTaskId)); } catch { closeDrawer(); }
+        }
       } else return; // try again next poll
     }
     S.version = r.version;
+    S.pollVersions = r.versions || null;
   } catch { /* offline - try again */ }
 }
 

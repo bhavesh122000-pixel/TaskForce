@@ -29,6 +29,7 @@ Desktop.ini
 .vscode/
 *.tmp
 .scratch/
+output/
 
 # Local documentation and handover reports
 [Rr][Ee][Aa][Dd][Mm][Ee]*

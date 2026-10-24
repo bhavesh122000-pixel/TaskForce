@@ -11,7 +11,7 @@ test('PostgreSQL read budgets, transaction rollback and cache isolation', async 
   const runtime = await createApplication({ db, storage: memoryStorage() });
   const call = (method, path, body = {}, query = {}) => runtime.platform.withRequest(
     () => runtime.core.handle({ method, path, body, query, token: 'performance-admin' }),
-    { readOnly: runtime.core.isReadOnly(method, path) }
+    runtime.requestOptions({ method, path, body, token:'performance-admin' })
   );
   try {
     await db.withConnection(async () => {
@@ -74,10 +74,19 @@ test('PostgreSQL read budgets, transaction rollback and cache isolation', async 
       assert.equal(result.status,200);
       assert.deepEqual(result.body.users.map(u => u.user_id),[2]);
     });
-    await t.test('two scheduler triggers run the jobs only once in a clock window', async () => {
-      await db.withConnection(() => runtime.core.setSetting('backup_time','99:99'));
-      const results = await Promise.all([runtime.jobs(),runtime.jobs()]);
-      assert.equal(results.filter(result => result.skipped).length,1);
+    // Scheduler coordination uses multiple real connections and is covered in
+    // postgres-concurrency.test.js; this single-connection fixture cannot model it.
+    await t.test('poll versions distinguish datasets and detect edits within one second', async () => {
+      const before = (await call('GET','/api/poll')).body.versions;
+      await call('PUT','/api/tasks/1',{title:'Edited once'});
+      const first = (await call('GET','/api/poll')).body.versions;
+      await call('PUT','/api/tasks/1',{title:'Edited twice'});
+      const second = (await call('GET','/api/poll')).body.versions;
+      assert.notEqual(first.tasks,before.tasks);
+      assert.notEqual(second.tasks,first.tasks);
+      for (const key of ['users','people','matterRefs','callbacks','library','settings']) assert.equal(second[key],before[key],key);
+      await db.withConnection(() => runtime.core.setSetting('scheduler_last_run',String(Date.now())));
+      assert.deepEqual((await call('GET','/api/poll')).body.versions,second);
     });
     await t.test('existing password hashes still authenticate', async () => {
       const salt = 'old-password-format';

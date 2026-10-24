@@ -9,6 +9,7 @@ const { createPostgres } = require('./postgres');
 const { createStorage } = require('./storage');
 const { createCloudPlatform } = require('./platform');
 const { handleDirectUpload } = require('./uploads');
+const { requestOptions } = require('./locks');
 
 async function createApplication(options = {}) {
   let { db, storage, platform } = options;
@@ -36,6 +37,10 @@ async function createApplication(options = {}) {
   app.get('/workflow.js', (req, res) => res.sendFile(path.join(__dirname, '..', 'core', 'workflow.js')));
   app.get('/vendor/mammoth.js', (req, res) => res.sendFile(require.resolve('mammoth/mammoth.browser.min.js')));
   app.get('/hosting.json', (req, res) => res.json({ directUploads: true }));
+  app.get('/api/health', (req, res) => {
+    const commit = process.env.RENDER_GIT_COMMIT || process.env.VERCEL_GIT_COMMIT_SHA || '';
+    res.json({ ok: true, commit: /^[a-f0-9]{40}$/i.test(commit) ? commit : null });
+  });
   app.use(express.static(path.join(__dirname, '..', 'public')));
   app.use('/api', express.json({ limit: '2mb' }));
   app.post('/api/setup', (req, res) => res.status(403).json({ error: 'Only an admin can create accounts. Sign in with the account supplied by your admin.' }));
@@ -65,17 +70,29 @@ async function createApplication(options = {}) {
     } catch (error) { next(error); }
   });
   async function jobs() {
+    const alreadyRan = (last, at = Date.now()) => Math.floor(at / 600000) === Math.floor(Number(last) / 600000);
+    // Most external calls arrive after another trigger already completed work.
+    // Check without a write lock; repeat the check inside the transaction below.
+    if (await withRequest(async () => alreadyRan(await core.getSetting('scheduler_last_run', '0')), { readOnly: true })) return { ok: true, skipped: true };
     const state = await withRequest(async () => {
+      // Duplicate triggers must not fill the pool waiting for the coordinator;
+      // the winning run needs connections for its short record transactions.
+      if (!(await db.tryLockKey('scheduler'))) return { ok:true, skipped:true };
       const startedAt = Date.now();
       const lastRun = Number(await core.getSetting('scheduler_last_run', '0'));
-      if (Math.floor(startedAt / 600000) === Math.floor(lastRun / 600000)) return { ok: true, skipped: true };
-      await core.runJobs();
+      if (alreadyRan(lastRun, startedAt)) return { ok: true, skipped: true };
+      await core.runJobs({ transaction: (callback, scope = {}) => {
+        const options = scope.taskId
+          ? requestOptions(db, core, { method:'PUT', path:`/api/tasks/${scope.taskId}` })
+          : { scoped:true, before:() => db.lockKeys([scope.matterId && `matter:${scope.matterId}`, scope.callbackId && `callback:${scope.callbackId}`]) };
+        return withRequest(callback, { ...options, independent:true });
+      } });
       await core.setSetting('scheduler_last_run', String(startedAt));
       const d = new Date(), p = n => String(n).padStart(2, '0');
       const day = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
       const backupDue = `${p(d.getHours())}:${p(d.getMinutes())}` >= (await core.getSetting('backup_time', '22:00') || '22:00') && !(await core.getSetting('last_backup', '')).startsWith(day);
       return { ok: true, backupDue };
-    });
+    }, { coordinator:true });
     if (state.backupDue) await platform.backup();
     return { ok: true, ...(state.skipped ? { skipped: true } : {}) };
   }
@@ -92,7 +109,7 @@ async function createApplication(options = {}) {
       const result = await withRequest(async () => {
         const output = await handleDirectUpload({ req, context, db, core, storage });
         return output || core.handle(context);
-      }, { readOnly: core.isReadOnly(req.method, req.path) });
+      }, requestOptions(db, core, context));
       const body = result.body || {};
       const cookie = { httpOnly: true, secure: req.secure || !!process.env.VERCEL, sameSite: 'lax', path: '/' };
       if (body._session) { res.cookie('tf_session', body._session, { ...cookie, maxAge: 30 * 86400e3 }); delete body._session; }
@@ -109,8 +126,8 @@ async function createApplication(options = {}) {
   app.use((error, req, res, next) => {
     cleanup(req);
     console.error('[request]', error.message);
-    if (!res.headersSent) res.status(error.status || 503).json({ error: error.status === 400 ? error.message : 'The service is temporarily unavailable. Please try again.' });
+    if (!res.headersSent) res.status(error.status || 503).json({ error: error.status === 400 || error.code === 'TF_LOCK_BUSY' ? error.message : 'The service is temporarily unavailable. Please try again.' });
   });
-  return { app, core, db, storage, platform, jobs, port: parseInt(process.env.PORT || fileConfig.port || '3000', 10) || 3000, close: () => db.close() };
+  return { app, core, db, storage, platform, jobs, requestOptions: context => requestOptions(db, core, context), port: parseInt(process.env.PORT || fileConfig.port || '3000', 10) || 3000, close: () => db.close() };
 }
 module.exports = { createApplication };

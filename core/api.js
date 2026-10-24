@@ -2,6 +2,7 @@ const { mapAsync, forEachAsync } = require('./async');
 // TaskForce engine: every rule and API route lives here.
 // Shared application rules backed by PostgreSQL.
 const W = require('./workflow');
+const { dateMath } = require('./dates');
 const { initSchema, seedChecklists, seedMilestones, ensureLibrary, copyTemplates, defaultStages, seedHolidays } = require('./schema');
 
 const STATUS_LABEL = { todo: 'To do', progress: 'In progress', waiting: 'Waiting on', done: 'Done' };
@@ -123,22 +124,8 @@ async function createCore({ db, platform }) {
   const nextPos = async (status) => ((await q1('SELECT MAX(position) AS p FROM tasks WHERE status = ?', status)).p || 0) + 1;
 
   /* ---------- working days: weekends and full-day public holidays are skipped ---------- */
-  let holCache = { t: 0, set: new Set() };
-  async function holidaySet() {
-    if (Date.now() - holCache.t > 3000) holCache = { t: Date.now(), set: new Set((await qa("SELECT date FROM holidays WHERE part_from IS NULL OR part_from = ''")).map((r) => r.date)) };
-    return holCache.set;
-  }
-  // eslint-disable-next-line no-shadow
-  const businessDay = async (s, dir) => {
-    const hs = await holidaySet(),step = dir < 0 ? -1 : 1;
-    let d = s;
-    for (let n = 0; n < 40; n++) {
-      const [y, m, dd] = d.split('-').map(Number),dow = new Date(y, m - 1, dd).getDay();
-      if (dow !== 0 && dow !== 6 && !hs.has(d)) return d;
-      d = addDays(d, step);
-    }
-    return d;
-  };
+  const dates = () => db.memo('date-math', async () => dateMath(new Set((await qa("SELECT date FROM holidays WHERE part_from IS NULL OR part_from = ''")).map(row => row.date))));
+  const businessDay = async (value, direction) => (await dates()).businessDay(value, direction);
 
   /* ---------- stages and checklists (from the checklist library) ---------- */
   async function legacyTiming() {
@@ -148,17 +135,15 @@ async function createCore({ db, platform }) {
   }
   const stageRow = (r) => ({ key: r.key, label: r.label, from: r.from_kind, days: r.days, when: r.when_text });
   async function dueFrom(from, days, m) {
-    const base = from === 'opened' ? (m.created_at || '').slice(0, 10) : from === 'finance' ? m.finance_date : from === 'settlement' ? m.settlement_date : null;
-    if (!base) return null;
-    if (!days) return base;
-    return await businessDay(addDays(base, days), days < 0 ? -1 : 1);
+    return (await dates()).dueFrom(from, days, m);
   }
   const stageDue = async (stage, m) => await dueFrom(stage.from, stage.days, m);
   // Milestones on a matter, with their due dates worked out from the matter's dates (for the board, Gantt chart and calendar)
   async function milestonesOf(m, items, stages, values) {
+    const math = await dates();
     const sdr = W.sdrClaimed(m, values || {});
     const opened = (m.created_at || '').slice(0, 10) || null;
-    const dues = await mapAsync(stages, async (s) => ({ key: s.key, label: s.label, due: await stageDue(s, m) }));
+    const dues = stages.map(s => ({ key: s.key, label: s.label, due: math.stageDue(s, m) }));
     const known = new Set(stages.map((s) => s.key));
     const order = new Map(stages.map((s, i) => [s.key, i]));
     const td = today();
@@ -166,18 +151,18 @@ async function createCore({ db, platform }) {
     const tops = items.filter((i) => !i.parent_id);
     const rank = (it) => {const top = it.parent_id ? items.find((x) => x.id === it.parent_id) || it : it;return [order.has(top.stage) ? order.get(top.stage) : 999, top.position || 0, top.id, it.parent_id ? 1 : 0, it.position || 0];};
     const cmp = (a, b) => {const x = rank(a),y = rank(b);for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] - y[i];return 0;};
-    return (await mapAsync(items.filter((i) => i.ms), async (it) => {
+    return items.filter((i) => i.ms).map(it => {
       const ms = W.parseMs(it.ms);
       if (!ms) return null;
       const stageKey = it.parent_id ? (tops.find((t) => t.id === it.parent_id) || {}).stage || it.stage : it.stage;
       const st = dues.find((d) => d.key === stageKey) || { key: stageKey, label: (W.STAGES.find((x) => x.key === stageKey) || { label: stageKey }).label, due: null };
-      const due = ms.from ? await dueFrom(ms.from, ms.days || 0, m) : st.due;
+      const due = ms.from ? math.dueFrom(ms.from, ms.days || 0, m) : st.due;
       let start = due ? ms.lead != null ? addDays(due, -Math.abs(ms.lead)) : windowStart(due) : null;
       if (start && due && start > due) start = due;
       const done = W.itemDone(it, sdr);
       return { id: it.id, item_id: it.id, title: it.title, label: ms.label || it.title, stage: stageKey, stage_label: st.label, known: known.has(stageKey), status: it.status || '', value: it.value || '', person_id: it.person_id || null,
         ms, due, start, done, applies: !(ms.gstOnly && !m.gst_applies), overdue: !!(due && due < td && !done), statuses: W.statusOptions(it, W.sideOf(m.type) || 'P', !!it.parent_id) };
-    })).filter(Boolean).sort((a, b) => cmp(items.find((i) => i.id === a.id), items.find((i) => i.id === b.id)));
+    }).filter(Boolean).sort((a, b) => cmp(items.find((i) => i.id === a.id), items.find((i) => i.id === b.id)));
   }
   // A matter's stages: its own copy (made when a library checklist was added), or for older matters the standard ones
   async function stagesFor(m, rows) {
@@ -197,6 +182,7 @@ async function createCore({ db, platform }) {
   // Summarise a matter's checklist: progress, current stage, overdue and stuck items
   async function checklistSummary(m, items, stageRows) {
     const stages = await stagesFor(m, stageRows);
+    const math = await dates();
     const sdr = W.sdrClaimed(m, parseReadiness(m));
     const byParent = new Map();
     items.forEach((i) => {if (i.parent_id) {if (!byParent.has(i.parent_id)) byParent.set(i.parent_id, []);byParent.get(i.parent_id).push(i);}});
@@ -214,7 +200,7 @@ async function createCore({ db, platform }) {
         {total++;if (W.itemDone(t, sdr)) done++;}
         [t, ...kids].forEach((x) => {if (/stuck/i.test(x.status)) out.stuck.push({ stage: s.label, title: x.title });});
       }
-      const due = await stageDue(s, m);
+      const due = math.stageDue(s, m);
       const st = { key: s.key, label: s.label, when: s.when, due, total, done, complete: total > 0 && done === total, overdue: !!(due && due < td && done < total) };
       out.stages.push(st);
       out.total += total;out.done += done;
@@ -435,35 +421,48 @@ async function createCore({ db, platform }) {
   }
 
   /* ---------- background jobs: overdue tasks + escalations ---------- */
-  async function runJobs() {
+  async function runJobs({ transaction = async callback => callback() } = {}) {
     let changed = false;
     const td = today();
-    for (const t of await qa(`SELECT * FROM tasks WHERE status <> 'done' AND due_date IS NOT NULL AND due_date < ? AND overdue_notified = 0 AND assignee_id IS NOT NULL`, td)) {
-      await notify(t.assignee_id, null, t.id, 'overdue', `Overdue: “${await taskLabel(t)}” was due ${fmtDate(t.due_date)}`, `Overdue: ${await taskLabel(t)}`);
-      await run('UPDATE tasks SET overdue_notified = 1 WHERE id = ?', t.id);changed = true;
+    for (const candidate of await qa(`SELECT id FROM tasks WHERE status <> 'done' AND due_date IS NOT NULL AND due_date < ? AND overdue_notified = 0 AND assignee_id IS NOT NULL`, td)) {
+      await transaction(async () => {
+        const t = await q1('SELECT * FROM tasks WHERE id = ?', candidate.id);
+        if (!t || t.status === 'done' || !t.due_date || t.due_date >= td || t.overdue_notified || !t.assignee_id) return;
+        await notify(t.assignee_id, null, t.id, 'overdue', `Overdue: “${await taskLabel(t)}” was due ${fmtDate(t.due_date)}`, `Overdue: ${await taskLabel(t)}`);
+        await run('UPDATE tasks SET overdue_notified = 1 WHERE id = ?', t.id);changed = true;
+      }, {taskId:candidate.id});
     }
-    const admins = await qa("SELECT id FROM users WHERE role = 'admin' AND active = 1");
-    const matters = await enrichMatters(await qa("SELECT * FROM matters WHERE status = 'active' AND settlement_date IS NOT NULL AND settlement_date <= ?", addDays(td, 21)));
-    for (const m of matters) {
-      if (!m.escalations.length) continue;
-      for (const a of admins) {
-        const sent = await q1("SELECT id FROM notifications WHERE user_id = ? AND matter_id = ? AND kind = 'escalation' AND substr(created_at,1,10) = ?", a.id, m.id, td);
-        if (sent) continue;
-        const text = `Escalation – ${m.name} (settles ${fmtDate(m.settlement_date)}): ${m.escalations.join('. ')}`;
-        await notify(a.id, null, null, 'escalation', text, `Escalation: ${m.name}`, m.id);
-        changed = true;
-      }
+    for (const candidate of await qa("SELECT id FROM matters WHERE status = 'active' AND settlement_date IS NOT NULL AND settlement_date <= ?", addDays(td, 21))) {
+      await transaction(async () => {
+        const row = await q1("SELECT * FROM matters WHERE id = ? AND status = 'active' AND settlement_date IS NOT NULL AND settlement_date <= ?", candidate.id, addDays(td,21));
+        if (!row) return;
+        const [m] = await enrichMatters([row]);
+        if (!m.escalations.length) return;
+        for (const a of await qa("SELECT id FROM users WHERE role = 'admin' AND active = 1")) {
+          const sent = await q1("SELECT id FROM notifications WHERE user_id = ? AND matter_id = ? AND kind = 'escalation' AND substr(created_at,1,10) = ?", a.id, m.id, td);
+          if (sent) continue;
+          const text = `Escalation – ${m.name} (settles ${fmtDate(m.settlement_date)}): ${m.escalations.join('. ')}`;
+          await notify(a.id, null, null, 'escalation', text, `Escalation: ${m.name}`, m.id);
+          changed = true;
+        }
+      }, {matterId:candidate.id});
     }
-    await run('DELETE FROM sessions WHERE expires_at < ?', now());
-    await run('DELETE FROM file_tokens WHERE expires_at < ?', now());
-    await run('DELETE FROM login_codes WHERE created_at < ?', addDays(today(), -1) + ' 00:00:00');
-    if (!platform.deferLibrary) {try {await seedHolidays(db);} catch (e) {/* next run */}}
+    await transaction(async () => {
+      await run('DELETE FROM sessions WHERE expires_at < ?', now());
+      await run('DELETE FROM file_tokens WHERE expires_at < ?', now());
+      await run('DELETE FROM login_codes WHERE created_at < ?', addDays(today(), -1) + ' 00:00:00');
+      if (!platform.deferLibrary) {try {await seedHolidays(db);} catch (e) {/* next run */}}
+    });
     // call-backs that are past their call-back time
-    for (const c of await qa("SELECT * FROM callbacks WHERE status = 'open' AND due_at IS NOT NULL AND due_at < ? AND overdue_notified = 0", nowMin())) {
-      const text = `Call-back overdue: ${c.caller_name}${c.phone ? ' (' + c.phone + ')' : ''} – was due ${fmtDue(c.due_at)}`;
-      await notify(c.assignee_id, null, null, 'callback', text, text, c.matter_id, c.id);
-      if (c.for_user_id && c.for_user_id !== c.assignee_id) await notify(c.for_user_id, null, null, 'callback', text, text, c.matter_id, c.id);
-      await run('UPDATE callbacks SET overdue_notified = 1 WHERE id = ?', c.id);changed = true;
+    for (const candidate of await qa("SELECT id FROM callbacks WHERE status = 'open' AND due_at IS NOT NULL AND due_at < ? AND overdue_notified = 0", nowMin())) {
+      await transaction(async () => {
+        const c = await q1('SELECT * FROM callbacks WHERE id = ?', candidate.id);
+        if (!c || c.status !== 'open' || !c.due_at || c.due_at >= nowMin() || c.overdue_notified) return;
+        const text = `Call-back overdue: ${c.caller_name}${c.phone ? ' (' + c.phone + ')' : ''} – was due ${fmtDue(c.due_at)}`;
+        await notify(c.assignee_id, null, null, 'callback', text, text, c.matter_id, c.id);
+        if (c.for_user_id && c.for_user_id !== c.assignee_id) await notify(c.for_user_id, null, null, 'callback', text, text, c.matter_id, c.id);
+        await run('UPDATE callbacks SET overdue_notified = 1 WHERE id = ?', c.id);changed = true;
+      }, {callbackId:candidate.id});
     }
     return changed;
   }
@@ -501,6 +500,7 @@ async function createCore({ db, platform }) {
     const a = attempts.get(ip) || { n: 0, t: Date.now() };
     if (Date.now() - a.t > 15 * 60e3) {a.n = 0;a.t = Date.now();}
     if (a.n >= 10) throw err('Too many attempts. Wait 15 minutes and try again.', 429);
+    attempts.set(ip, a); // Share the counter before concurrent password checks yield.
     return { fail() {a.n++;attempts.set(ip, a);}, ok() {attempts.delete(ip);} };
   }
   // Email a 6-digit sign-in code
@@ -757,34 +757,43 @@ async function createCore({ db, platform }) {
   on('POST', '/api/tasks/:id/checklist', async ({ body, params }) => {
     const t = await q1('SELECT id FROM tasks WHERE id = ?', +params.id);if (!t) throw err('That task no longer exists.', 404);
     const text = String(body.text || '').trim();if (!text) throw err('Enter the checklist item.');
-    await run('INSERT INTO checklist_items (task_id, text, position) VALUES (?,?,?)', t.id, text, ((await q1('SELECT MAX(position) AS p FROM checklist_items WHERE task_id = ?', t.id)).p || 0) + 1);
-    await touchTask(t.id);return await taskFull(t.id);
+    await run(`WITH added AS (INSERT INTO checklist_items (task_id,text,position)
+      SELECT ?,?,COALESCE(MAX(position),0)+1 FROM checklist_items WHERE task_id = ? RETURNING id)
+      UPDATE tasks SET updated_at = ? WHERE id = ?`, t.id,text,t.id,now(),t.id);
+    return await taskFull(t.id);
   });
   on('PUT', '/api/checklist/:id', async ({ me, body, params }) => {
     const c = await q1('SELECT * FROM checklist_items WHERE id = ?', +params.id);if (!c) throw err('Item not found.', 404);
-    if (body.done != null) await run('UPDATE checklist_items SET done = ? WHERE id = ?', body.done ? 1 : 0, c.id);
-    if (body.text != null && String(body.text).trim()) await run('UPDATE checklist_items SET text = ? WHERE id = ?', String(body.text).trim(), c.id);
-    if (body.done != null && !!body.done !== !!c.done) await log({ taskId: c.task_id, userId: me.id, action: `${body.done ? 'ticked' : 'unticked'} “${c.text}”` });
-    await touchTask(c.task_id);return await taskFull(c.task_id);
+    const sets = [], values = [], changes = [];
+    if (body.done != null) {sets.push('done = ?');values.push(body.done ? 1 : 0);}
+    if (body.text != null && String(body.text).trim()) {sets.push('text = ?');values.push(String(body.text).trim());}
+    if (sets.length) {changes.push(`edited AS (UPDATE checklist_items SET ${sets.join(',')} WHERE id = ? RETURNING id)`);values.push(c.id);}
+    if (body.done != null && !!body.done !== !!c.done) {
+      changes.push('recorded AS (INSERT INTO activity (task_id,user_id,action,created_at) VALUES (?,?,?,?) RETURNING id)');
+      values.push(c.task_id,me.id,`${body.done ? 'ticked' : 'unticked'} “${c.text}”`,now());
+    }
+    await run(`${changes.length ? 'WITH '+changes.join(',')+' ' : ''}UPDATE tasks SET updated_at = ? WHERE id = ?`, ...values,now(),c.task_id);
+    return await taskFull(c.task_id);
   });
   on('DELETE', '/api/checklist/:id', async ({ params }) => {
     const c = await q1('SELECT * FROM checklist_items WHERE id = ?', +params.id);if (!c) throw err('Item not found.', 404);
-    await run('DELETE FROM checklist_items WHERE id = ?', c.id);await touchTask(c.task_id);return await taskFull(c.task_id);
+    await run('WITH removed AS (DELETE FROM checklist_items WHERE id = ? RETURNING id) UPDATE tasks SET updated_at = ? WHERE id = ?', c.id,now(),c.task_id);
+    return await taskFull(c.task_id);
   });
   on('POST', '/api/tasks/:id/notes', async ({ me, body, params }) => {
     const t = await q1('SELECT * FROM tasks WHERE id = ?', +params.id);if (!t) throw err('That task no longer exists.', 404);
     const text = String(body.body || '').trim();if (!text) throw err('Write a note first.');
-    await run('INSERT INTO notes (task_id, user_id, body, created_at) VALUES (?,?,?,?)', t.id, me.id, text, now());
-    await touchTask(t.id);
+    await run('WITH added AS (INSERT INTO notes (task_id,user_id,body,created_at) VALUES (?,?,?,?) RETURNING id) UPDATE tasks SET updated_at = ? WHERE id = ?', t.id,me.id,text,now(),now(),t.id);
     const mentioned = new Set();
-    for (const u of await qa('SELECT * FROM users WHERE active = 1')) {
+    const activeUsers = await qa('SELECT * FROM users WHERE active = 1');
+    for (const u of activeUsers) {
       const first = u.name.split(/\s+/)[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       if (new RegExp(`@(${first}|${u.initials})\\b`, 'i').test(text)) mentioned.add(u.id);
     }
     const snip = text.length > 140 ? text.slice(0, 140) + '…' : text;
     await forEachAsync(mentioned, async (uid) => await notify(uid, me.id, t.id, 'mention', `${me.name} mentioned you on “${await taskLabel(t)}”: ${snip}`, `${me.name} mentioned you: ${await taskLabel(t)}`));
     await forEachAsync([t.assignee_id, t.created_by].filter((v, i, a) => v && a.indexOf(v) === i && !mentioned.has(v) && v !== me.id), async (uid) => {
-      const u = await userById(uid);if (!u || !u.active) return;
+      const u = activeUsers.find(user => user.id === uid);if (!u) return;
       await run('INSERT INTO notifications (user_id, task_id, kind, text, created_at) VALUES (?,?,?,?,?)', uid, t.id, 'note', `${me.name} added a note on “${await taskLabel(t)}”: ${snip}`, now());
     });
     return await taskFull(t.id);
@@ -1352,17 +1361,26 @@ async function createCore({ db, platform }) {
   });
   on('GET', '/api/poll', async ({ me }) => {
     if (platform.runJobsOnPoll) await runJobs();
+    // xmin changes on every committed update, including edits within the same
+    // second. Return only hashes, never row contents or transaction identifiers.
+    const stamp = (table, key = 'id', where = '') => `(SELECT md5(COALESCE(string_agg(${key}::text || ':' || xmin::text, ',' ORDER BY ${key}), '')) FROM ${table}${where})`;
     const r = await q1(`SELECT
       (SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read = 0) AS unread,
-      (SELECT COALESCE(MAX(updated_at),'') FROM tasks) || '|' || (SELECT COUNT(*) FROM tasks) || '|' ||
-      (SELECT COALESCE(MAX(updated_at),'') FROM matters) || '|' || (SELECT COUNT(*) FROM matters) || '|' ||
-      (SELECT COALESCE(MAX(id),0) FROM activity) || '|' ||
-      (SELECT COALESCE(MAX(updated_at),'') || '|' || COUNT(*) FROM callbacks) || '|' ||
-      (SELECT COUNT(*) || ':' || COALESCE(MAX(id),0) || ':' || COALESCE(SUM(LENGTH(start_date || end_date || kind)),0) FROM leave) || '|' ||
-      (SELECT COUNT(*) FROM holidays) AS version,
+      ${stamp('tasks')} AS _tasks,
+      ${stamp('matters')} AS _matter_refs,
+      ${stamp('matter_items')} || ${stamp('matter_stages')} AS _items,
+      ${stamp('callbacks')} || ${stamp('callback_log')} AS _callbacks,
+      ${stamp('leave')} || ${stamp('holidays')} AS _people,
+      ${stamp('users')} AS _users,
+      ${stamp('time_entries')} || ${stamp('work_logs')} AS _time,
+      ${stamp('checklists')} || ${stamp('checklist_stages')} || ${stamp('checklist_templates')} AS _library,
+      ${stamp('settings', 'key', " WHERE key NOT IN ('scheduler_last_run','last_backup')")} AS _settings,
       COUNT(*) AS callbacks_open,
       COALESCE(SUM(CASE WHEN due_at IS NULL OR due_at <= ? THEN 1 ELSE 0 END),0) AS callbacks_due
       FROM callbacks WHERE status = 'open' AND assignee_id = ?`, me.id, nowMin(), me.id);
+    r.versions = { tasks:r._tasks, matterRefs:r._matter_refs, matters:r._matter_refs + r._items, callbacks:r._callbacks, people:r._people, users:r._users, time:r._time, library:r._library, settings:r._settings };
+    r.version = Object.values(r.versions).join('|'); // Opaque fallback for older browser tabs.
+    for (const key of Object.keys(r)) if (key.startsWith('_')) delete r[key];
     return r;
   });
   on('GET', '/api/search', async ({ me, query }) => {
@@ -1389,10 +1407,9 @@ async function createCore({ db, platform }) {
     const part = body.part_from ? /^\d{2}:\d{2}$/.test(String(body.part_from)) ? String(body.part_from) : undefined : null;
     if (part === undefined) throw err('The part-day start time isn’t valid.');
     await run("INSERT INTO holidays (date, name, part_from, source, created_at) VALUES (?,?,?, 'admin', ?)", date, name, part, now());
-    holCache.t = 0;
     return { ok: true };
   });
-  on('DELETE', '/api/holidays/:id', async ({ me, params }) => {adminOnly(me);await run('DELETE FROM holidays WHERE id = ?', +params.id);holCache.t = 0;return { ok: true };});
+  on('DELETE', '/api/holidays/:id', async ({ me, params }) => {adminOnly(me);await run('DELETE FROM holidays WHERE id = ?', +params.id);return { ok: true };});
 
   /* ---------- leave: who isn't working when ---------- */
   const LEAVE_PARTS = ['', 'am', 'pm'];

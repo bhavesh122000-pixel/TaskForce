@@ -74,6 +74,9 @@ test('HTTP sessions, direct uploads, file privacy, backups and concurrent writes
     });
     await t.test('static files and cron authorization', async () => {
       for (const url of ['/', '/app.js', '/workflow.js', '/vendor/mammoth.js', '/hosting.json']) assert.equal((await fetch(base + url)).status, 200);
+      const health = await request('GET','/api/health');
+      assert.equal(health.status,200);assert.equal(health.data.ok,true);
+      assert.deepEqual(Object.keys(health.data).sort(),['commit','ok']);
       assert.equal((await request('GET', '/api/cron')).status, 401);
     });
   } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await db.close(); }

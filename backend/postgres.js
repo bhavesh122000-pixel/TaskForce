@@ -55,10 +55,10 @@ function normalize(result) {
 function createPostgres({ connectionString = process.env.DATABASE_URL, pool, schema = process.env.SUPABASE_DB_SCHEMA || 'taskforce_app', timezone = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone } = {}) {
   if (!/^[a-z_][a-z0-9_]*$/.test(schema)) throw new Error('Invalid SUPABASE_DB_SCHEMA.');
   if (!pool && !connectionString) throw new Error('Set DATABASE_URL to the Supabase PostgreSQL connection string in .env.local.');
-  const max = Math.min(20, Math.max(2, parseInt(process.env.PG_POOL_MAX || '5', 10) || 5));
+  const max = Math.min(20, Math.max(2, parseInt(process.env.PG_POOL_MAX || '10', 10) || 10));
   const connections = pool || new Pool({ ...connectionOptions(connectionString), max, idleTimeoutMillis: 30000 });
   connections.on?.('error', error => console.error('[postgres pool]', error.code || error.message));
-  const context = new AsyncLocalStorage(), compiled = new Map();
+  const context = new AsyncLocalStorage(), compiled = new Map(), queues = new Map();
   function sqlText(sql) {
     if (!compiled.has(sql)) {
       if (compiled.size >= 1000) compiled.clear();
@@ -84,24 +84,75 @@ function createPostgres({ connectionString = process.env.DATABASE_URL, pool, sch
       if (!current.cache.has(key)) current.cache.set(key, Promise.resolve().then(loader));
       return current.cache.get(key);
     },
-    async withConnection(callback, { readOnly = false, independent = false } = {}) {
+    async withConnection(callback, { readOnly = false, independent = false, pinRead = true, scoped = false, before, coordinator = false, queueKey = null, lockDeadline = Date.now()+60000 } = {}) {
       if (context.getStore() && !independent) return callback();
-      if (readOnly) return context.run({ readOnly: true, cache: new Map() }, callback);
+      if (queueKey && !readOnly) {
+        // Queue known contention locally before checking out a connection. The
+        // PostgreSQL locks below still enforce correctness across server processes.
+        const previous = queues.get(queueKey) || Promise.resolve();
+        let release;
+        const next = new Promise(resolve => { release = resolve; });
+        queues.set(queueKey,next);
+        await previous;
+        try { return await db.withConnection(callback,{readOnly,independent,pinRead,scoped,before,coordinator,lockDeadline}); }
+        finally { release();if(queues.get(queueKey)===next)queues.delete(queueKey); }
+      }
+      if (readOnly) {
+        // Most handlers have sequential queries. Reuse a single checked-out client
+        // without opening a transaction. Storage-only wrappers can opt out.
+        const client = pinRead ? await connections.connect() : null;
+        try { return await context.run({ client, readOnly: true, cache: new Map() }, callback); }
+        finally { client?.release(); }
+      }
       const client = await connections.connect();
-      const current = { client, readOnly: false, savepoints: [], cache: new Map() };
+      const current = { client, readOnly: false, savepoints: [], cache: new Map(), acquiring:scoped && !!before };
+      let retry = false;
       try {
         await client.query('BEGIN');
-        // Writes retain cross-process ordering for multi-record business rules.
-        // Ordinary page reads do not take this lock or hold a transaction open.
-        await client.query("SELECT set_config('TimeZone', $1, true), pg_advisory_xact_lock(hashtextextended($2, 0))", [timezone, schema]);
-        const result = await context.run(current, callback);
+        // The original key is an exclusive maintenance gate. Scoped requests
+        // share it, then lock their affected records. Old server versions still
+        // take this same key exclusively, so rolling deploys remain coordinated.
+        const gate = scoped ? 'pg_advisory_xact_lock_shared' : 'pg_advisory_xact_lock';
+        // The scheduler coordinator holds only its own key. Its independent
+        // record transactions acquire the gate; holding it here could deadlock
+        // them behind an administrative request waiting for exclusive access.
+        if (coordinator) await client.query("SELECT set_config('TimeZone', $1, true)", [timezone]);
+        else await client.query(`SELECT set_config('TimeZone', $1, true), ${gate}(hashtextextended($2, 0))`, [timezone, schema]);
+        const result = await context.run(current, async () => { if (before) await before(); current.acquiring=false;return callback(); });
         const rejected = result?.status >= 400 && !result.commitOnError;
         const commit = await client.query(rejected ? 'ROLLBACK' : 'COMMIT');
         if (!rejected && commit.command === 'ROLLBACK') throw new Error('The database transaction could not be committed.');
         return result;
-      } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error; }
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        // Only lock acquisition is retried. The handler has not started, so no
+        // application writes, uploads or notifications can be repeated.
+        if(error.code==='TF_LOCK_BUSY' && current.acquiring && Date.now()<lockDeadline)retry=true;
+        else throw error;
+      }
       finally { client.release(); }
+      if(retry){
+        await new Promise(resolve=>setTimeout(resolve,100+Math.random()*150));
+        return db.withConnection(callback,{readOnly,independent,pinRead,scoped,before,coordinator,lockDeadline});
+      }
     },
+    async lockKeys(keys) {
+      const current = context.getStore();
+      if (!current?.client || current.readOnly) throw new Error('Record locks require a write transaction.');
+      // Acquire sequentially in a stable order; never depend on SQL planner order.
+      for (const key of [...new Set(keys.filter(Boolean))].sort()) {
+        if(current.acquiring){
+          const result=await current.client.query('SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked', [`${schema}:${key}`]);
+          if(!result.rows[0].locked)throw Object.assign(new Error('Another edit is still running. Please try again.'),{code:'TF_LOCK_BUSY',status:409});
+        } else await current.client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`${schema}:${key}`]);
+      }
+    },
+    async tryLockKey(key) {
+      const current = context.getStore();
+      if (!current?.client || current.readOnly) throw new Error('Record locks require a write transaction.');
+      return (await current.client.query('SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked', [`${schema}:${key}`])).rows[0].locked;
+    },
+    poolStats: () => ({ max, total: connections.totalCount || 0, idle: connections.idleCount || 0, waiting: connections.waitingCount || 0 }),
     prepare(sql) {
       return {
         async get(...params) { return (await query(sql, params)).rows[0]; },
