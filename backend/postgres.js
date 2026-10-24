@@ -55,7 +55,7 @@ function normalize(result) {
 function createPostgres({ connectionString = process.env.DATABASE_URL, pool, schema = process.env.SUPABASE_DB_SCHEMA || 'taskforce_app', timezone = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone } = {}) {
   if (!/^[a-z_][a-z0-9_]*$/.test(schema)) throw new Error('Invalid SUPABASE_DB_SCHEMA.');
   if (!pool && !connectionString) throw new Error('Set DATABASE_URL to the Supabase PostgreSQL connection string in .env.local.');
-  const max = Math.min(20, Math.max(2, parseInt(process.env.PG_POOL_MAX || '10', 10) || 10));
+  const max = Math.min(20, Math.max(2, parseInt(process.env.PG_POOL_MAX || '15', 10) || 15));
   const connections = pool || new Pool({ ...connectionOptions(connectionString), max, idleTimeoutMillis: 30000 });
   connections.on?.('error', error => console.error('[postgres pool]', error.code || error.message));
   const context = new AsyncLocalStorage(), compiled = new Map(), queues = new Map();

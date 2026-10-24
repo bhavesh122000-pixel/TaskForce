@@ -30,6 +30,8 @@ Desktop.ini
 *.tmp
 .scratch/
 output/
+*.mp4
+*.webm
 
 # Local documentation and handover reports
 [Rr][Ee][Aa][Dd][Mm][Ee]*

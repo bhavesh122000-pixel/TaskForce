@@ -675,3 +675,6 @@ table.ts td { vertical-align: top; }
 :root[data-theme="dark"] .c-holiday { --ev-bg: #4a1f26; }
 @media (max-width: 900px) { .grid-time { grid-template-columns: 1fr; } }
 @media (max-width: 760px) { .ts-day, .ts-times { width: auto; } .clock-btn .btn-label { display: none; } #clockMenu { position: fixed; top: 52px; left: 4px; right: 4px; } }
+
+/* Fast navigation loading indicator */
+#main.nav-loading { opacity: 0.6; pointer-events: none; transition: opacity 0.12s ease-out; }

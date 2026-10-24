@@ -32,8 +32,30 @@ function store(key, val) {
   try { if (val === undefined) return JSON.parse(localStorage.getItem('tf_' + key)); localStorage.setItem('tf_' + key, JSON.stringify(val)); } catch { return null; }
 }
 let hostingOptions;
-async function api(method, url, body) {
-  const opts = { method, headers: {} };
+const apiCache = new Map();
+const inFlight = new Map();
+
+function clearApiCache(prefix = '') {
+  if (!prefix) {
+    apiCache.clear();
+  } else {
+    for (const key of apiCache.keys()) {
+      if (key.includes(prefix)) apiCache.delete(key);
+    }
+  }
+}
+
+async function api(method, url, body, opts = {}) {
+  const isGet = method === 'GET';
+  if (!isGet) {
+    clearApiCache();
+  } else if (!opts.fresh && apiCache.has(url)) {
+    return apiCache.get(url);
+  } else if (isGet && inFlight.has(url)) {
+    return inFlight.get(url);
+  }
+
+  const reqOpts = { method, headers: {} };
   if (body instanceof FormData) {
     hostingOptions ||= fetch('/hosting.json').then(r => r.ok ? r.json() : {}).catch(() => ({}));
     if ((await hostingOptions).directUploads) {
@@ -43,17 +65,32 @@ async function api(method, url, body) {
         const result = await fetch(grant.uploads[i].url, { method: 'PUT', headers: { 'Content-Type': files[i].type || 'application/octet-stream' }, body: files[i] });
         if (!result.ok) throw new Error('File upload failed. Please try again.');
       }
-      opts.headers['Content-Type'] = 'application/json';
-      opts.body = JSON.stringify({ _cloudUploads: grant.uploads.map(upload => upload.id) });
-    } else opts.body = body;
+      reqOpts.headers['Content-Type'] = 'application/json';
+      reqOpts.body = JSON.stringify({ _cloudUploads: grant.uploads.map(upload => upload.id) });
+    } else reqOpts.body = body;
   }
-  else if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
-  const r = await fetch(url, opts);
-  let data = null;
-  try { data = await r.json(); } catch { /* not json */ }
-  if (r.status === 401 && !url.includes('/api/login')) { S.me = null; renderLogin(); throw new Error('Signed out'); }
-  if (!r.ok) throw new Error((data && data.error) || 'Something went wrong.');
-  return data;
+  else if (body !== undefined) { reqOpts.headers['Content-Type'] = 'application/json'; reqOpts.body = JSON.stringify(body); }
+
+  const runFetch = async () => {
+    try {
+      const r = await fetch(url, reqOpts);
+      let data = null;
+      try { data = await r.json(); } catch { /* not json */ }
+      if (r.status === 401 && !url.includes('/api/login')) { S.me = null; renderLogin(); throw new Error('Signed out'); }
+      if (!r.ok) throw new Error((data && data.error) || 'Something went wrong.');
+      if (isGet) apiCache.set(url, data);
+      return data;
+    } finally {
+      if (isGet) inFlight.delete(url);
+    }
+  };
+
+  if (isGet) {
+    const p = runFetch();
+    inFlight.set(url, p);
+    return p;
+  }
+  return runFetch();
 }
 let toastTimer;
 function toast(msg, isErr) {
@@ -155,6 +192,13 @@ async function boot() {
     route();
     startPolling();
     if (window.startTimeWatch) startTimeWatch();
+    setTimeout(() => {
+      if (S.me) {
+        api('GET', '/api/tasks?done_days=14').catch(() => {});
+        api('GET', '/api/matters?area=conv&status=active&type=&q=').catch(() => {});
+        api('GET', '/api/matters?status=active').catch(() => {});
+      }
+    }, 400);
   } catch (e) {
     document.getElementById('app').innerHTML = `<div class="auth-wrap"><div class="auth-card"><h2>Can’t reach TaskForce</h2><p class="sec">Check the TaskForce computer is switched on and running, then refresh this page.</p></div></div>`;
   }
@@ -302,19 +346,30 @@ async function globalSearch(q) {
 
 /* ---------------- router ---------------- */
 window.addEventListener('hashchange', () => { if (!S.me) return; if ($('#drawer')) closeDrawer(true); closeModal(); route(); });
-function route() {
+let navGeneration = 0;
+async function route() {
   const h = location.hash.replace(/^#\/?/, '') || 'board';
   const [r, a, b] = h.split('/');
   if (r === 'task' && a) { location.replace('#/board'); setTimeout(() => openTask(+a), 50); return; }
   $$('.nav a').forEach(x => x.classList.toggle('on', x.dataset.r === r));
   const main = $('#main');
   if (!main) return;
-  return ({
-    board: renderBoard, list: renderList, calendar: renderCalendar, matters: a ? () => renderMatter(+a, b) : () => renderMatters('conv'),
-    tax: () => (S.me.can_tax ? renderMatters('tax') : renderBoard()),
-    time: () => renderTime(),
-    readiness: renderReadiness, settlements: renderReadiness, callbacks: () => renderCallbacks(a ? +a : null), admin: () => renderAdmin(a || 'users'),
-  }[r] || renderBoard)();
+  const gen = ++navGeneration;
+  const timer = setTimeout(() => {
+    if (gen === navGeneration && main) main.classList.add('nav-loading');
+  }, 80);
+  try {
+    const fn = {
+      board: renderBoard, list: renderList, calendar: renderCalendar, matters: a ? () => renderMatter(+a, b) : () => renderMatters('conv'),
+      tax: () => (S.me.can_tax ? renderMatters('tax') : renderBoard()),
+      time: () => renderTime(),
+      readiness: renderReadiness, settlements: renderReadiness, callbacks: () => renderCallbacks(a ? +a : null), admin: () => renderAdmin(a || 'users'),
+    }[r] || renderBoard;
+    return await fn();
+  } finally {
+    clearTimeout(timer);
+    if (gen === navGeneration && main) main.classList.remove('nav-loading');
+  }
 }
 function refreshView() { return route(); }
 
@@ -783,8 +838,11 @@ async function performPoll(generation) {
       const typing = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
       if (!document.hidden && !$('#modal') && !typing && !document.querySelector('.tcard.dragging, .oc-dragging, .oc-preview')) {
         const updates = [];
-        if (changed('matterRefs')) updates.push(api('GET', '/api/matters?status=all&brief=1').then(rows => { S.matters = rows; }));
-        if (changed('users')) updates.push(Promise.all([api('GET','/api/users'), api('GET','/api/me')]).then(([users, me]) => { S.users = users; S.me = me.user; S.firm = me.firm; }));
+        if (changed('matterRefs')) { if (typeof clearApiCache === 'function') clearApiCache('/api/matters'); updates.push(api('GET', '/api/matters?status=all&brief=1', undefined, { fresh: true }).then(rows => { S.matters = rows; })); }
+        if (changed('users')) { if (typeof clearApiCache === 'function') { clearApiCache('/api/users'); clearApiCache('/api/me'); } updates.push(Promise.all([api('GET','/api/users', undefined, { fresh: true }), api('GET','/api/me', undefined, { fresh: true })]).then(([users, me]) => { S.users = users; S.me = me.user; S.firm = me.firm; })); }
+        if (changed('tasks') && typeof clearApiCache === 'function') clearApiCache('/api/tasks');
+        if (changed('matters') && typeof clearApiCache === 'function') clearApiCache('/api/matters');
+        if (changed('callbacks') && typeof clearApiCache === 'function') clearApiCache('/api/callbacks');
         if (changed('people') && window.loadPeopleDates) updates.push(loadPeopleDates());
         if ((changed('time') || changed('settings')) && window.refreshTime) updates.push(refreshTime());
         await Promise.all(updates);
@@ -931,6 +989,7 @@ function account() {
 
 /* ---------------- public actions ---------------- */
 window.TF = {
+  clearCache: clearApiCache,
   openTask, closeDrawer: s => closeDrawer(s), newTask, setTask, postNote, closeModal, userForm, account, toggleNotifs, openNotif, readAll,
   viewEmail,
   download(id, inline) {
